@@ -3,8 +3,8 @@
 #include "common/json-schema-to-grammar.cpp"
 #include "common/grammar-parser.cpp"
 #include "utils.hpp"
-#include "source/extensions/filters/http/llm_inference/inference/inference_context.h"
-#include "source/extensions/filters/http/llm_inference/inference/inference_task.h"
+#include "contrib/llm_inference/filters/http/source/inference/inference_context.h"
+#include "contrib/llm_inference/filters/http/source/inference/inference_task.h"
 #include <cstdio>
 #include <memory>
 

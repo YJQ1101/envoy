@@ -1,4 +1,4 @@
-#include "source/extensions/filters/http/llm_inference/inference/inference_thread.h"
+#include "contrib/llm_inference/filters/http/source/inference/inference_thread.h"
 
 #include "envoy/thread/thread.h"
 #include <algorithm>

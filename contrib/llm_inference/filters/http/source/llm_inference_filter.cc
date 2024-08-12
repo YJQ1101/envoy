@@ -1,4 +1,5 @@
-#include "source/extensions/filters/http/llm_inference/llm_inference_filter.h"
+#include "contrib/llm_inference/filters/http/source/llm_inference_filter.h"
+
 #include "source/common/buffer/buffer_impl.h"
 
 #include "envoy/server/filter_config.h"
@@ -14,8 +15,12 @@ namespace HttpFilters {
 namespace LLMInference {
 
 LLMInferenceFilterConfig::LLMInferenceFilterConfig(
-    const envoy::extensions::filters::http::llm_inference::LLMInference& proto_config)
-    : key_(proto_config.key()), val_(proto_config.val()) {}
+    const envoy::extensions::filters::http::llm_inference::v3::modelParameter& proto_config)
+    : n_thread_(proto_config.n_thread()), modelPath_(proto_config.modelpath()) {}
+
+LLMInferenceFilterConfigPerRoute::LLMInferenceFilterConfigPerRoute(
+    const envoy::extensions::filters::http::llm_inference::v3::modelChosen& proto_config)
+    : modelChosen_(proto_config.usemodel()) {}
 
 LLMInferenceFilter::LLMInferenceFilter(LLMInferenceFilterConfigSharedPtr config, LLMInferenceTaskSharedPtr task)
     : config_(config), task_(task) {}
@@ -24,35 +29,32 @@ LLMInferenceFilter::~LLMInferenceFilter() {}
 
 void LLMInferenceFilter::onDestroy() {}
 
-const std::string LLMInferenceFilter::headerKey() const {
-  return config_->key();
+int LLMInferenceFilter::n_thread() const {
+  return config_->n_thread();
 }
 
-const std::string LLMInferenceFilter::headerValue() const {
-  return config_->val();
+const ModelPath LLMInferenceFilter::modelPath() const {
+  return config_->modelPath();
 }
 
 Http::FilterHeadersStatus LLMInferenceFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end_stream) {
-  // std::cout << headers.getPathValue() << std::endl;
   if (end_stream) {
     // If this is a header-only request, we don't need to do any inference.
     return Http::FilterHeadersStatus::Continue;
   }
 
   // Route-level configuration overrides filter-level configuration.
-  // const auto* per_route_inference_settings =
-  //     Http::Utility::resolveMostSpecificPerFilterConfig<LLMInferenceFilterConfig>(
-  //         "envoy.filters.http.llm_inference", decoder_callbacks_->route());
-  // if (!per_route_inference_settings) {
-  //   return Http::FilterHeadersStatus::Continue;
-  // }
-  
-  const absl::string_view headersPath = headers.getPathValue();
-  if (headersPath == "/v1/chat/completions") {
-    task_type_ = INFERENCETASKTYPE_CHAT_COMPLETION;
-  } else if (headersPath == "/v1/embeddings") {
-    task_type_ = INFERENCETASKTYPE_EMBEDDINGS;
-  } 
+  const auto* per_route_inference_settings =
+      Http::Utility::resolveMostSpecificPerFilterConfig<LLMInferenceFilterConfigPerRoute>(
+          "envoy.filters.http.llm_inference", decoder_callbacks_->route());
+  if (!per_route_inference_settings) {
+    return Http::FilterHeadersStatus::Continue;
+  } else {
+    ModelChosen cc = per_route_inference_settings->modelChosen();
+    for (int i = 0; i < cc.size(); ++i) {
+        std::cout << "usemodel: " << cc.Get(i) << std::endl;
+    }
+  }
 
   if (task_type_ == INFERENCETASKTYPE_DEFAULT) {
     // If this is not match, we don't need to do any inference.

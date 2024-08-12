@@ -1,17 +1,21 @@
 syntax = "proto3";
 
-package envoy.extensions.filters.http.llm_inference;
+package envoy.extensions.filters.http.llm_inference.v3;
 
 import "udpa/annotations/status.proto";
 import "validate/validate.proto";
 
-option (udpa.annotations.file_status).work_in_progress = true;
+option java_package = "io.envoyproxy.envoy.extensions.filters.http.llm_inference.v3";
+option java_outer_classname = "LlmInferenceProto";
+option java_multiple_files = true;
+option (udpa.annotations.file_status).package_version_status = ACTIVE;
 
 message modelParameter {
-    int n_thread = 1;
-    map<string, string> modelName_to_modelPath = 2;
+  int32 n_thread = 1;
+
+  map<string, string> modelpath = 2;
 }
 
-message modelInference {
-    repeated string useModel = 1;
+message modelChosen {
+  repeated string usemodel = 1;
 }

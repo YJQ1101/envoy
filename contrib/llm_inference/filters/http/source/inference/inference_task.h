@@ -1,7 +1,7 @@
 #pragma once
 
-#include "source/extensions/filters/http/llm_inference/inference/inference_thread.h"
-#include "source/extensions/filters/http/llm_inference/inference/inference_context.h"
+#include "contrib/llm_inference/filters/http/source/inference/inference_thread.h"
+#include "contrib/llm_inference/filters/http/source/inference/inference_context.h"
 #include "source/extensions/filters/http/common/factory_base.h"
 
 namespace Envoy {

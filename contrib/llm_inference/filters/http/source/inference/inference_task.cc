@@ -1,5 +1,4 @@
-#include "source/extensions/filters/http/llm_inference/inference/inference_task.h"
-// #include "source/extensions/filters/http/llm_inference/inference/inference_context.h"
+#include "contrib/llm_inference/filters/http/source/inference/inference_task.h"
 #include <memory>
 
 namespace Envoy {

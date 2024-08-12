@@ -3,27 +3,41 @@
 #include <string>
 
 #include "source/extensions/filters/http/common/pass_through_filter.h"
-#include "envoy/extensions/filters/http/llm_inference/llm_inference.pb.h"
-#include "source/extensions/filters/http/llm_inference/inference/inference_task.h"
+#include "contrib/envoy/extensions/filters/http/llm_inference/v3/llm_inference.pb.h"
+#include "contrib/llm_inference/filters/http/source/inference/inference_task.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace LLMInference {
 
+using ModelPath = Protobuf::Map<std::string, std::string>;
+
 class LLMInferenceFilterConfig : public Router::RouteSpecificFilterConfig  {
 public:
-  LLMInferenceFilterConfig(const envoy::extensions::filters::http::llm_inference::LLMInference& proto_config);
+  LLMInferenceFilterConfig(const envoy::extensions::filters::http::llm_inference::v3::modelParameter& proto_config);
 
-  const std::string& key() const { return key_; }
-  const std::string& val() const { return val_; }
+  const int& n_thread() const {return n_thread_;}
+  const ModelPath& modelPath() const {return modelPath_; }
 
 private:
-  const std::string key_;
-  const std::string val_;
+  const int n_thread_;
+  const ModelPath modelPath_;
 };
 
 using LLMInferenceFilterConfigSharedPtr = std::shared_ptr<LLMInferenceFilterConfig>;
+
+using ModelChosen = Protobuf::RepeatedPtrField<std::string>;
+
+class LLMInferenceFilterConfigPerRoute : public Router::RouteSpecificFilterConfig  {
+public:
+  LLMInferenceFilterConfigPerRoute(const envoy::extensions::filters::http::llm_inference::v3::modelChosen& proto_config);
+
+  const ModelChosen& modelChosen() const {return modelChosen_;};
+
+private:
+  const ModelChosen modelChosen_;
+};
 
 class LLMInferenceFilter : public Http::PassThroughDecoderFilter,
                            public std::enable_shared_from_this<LLMInferenceFilter> {
@@ -57,8 +71,8 @@ private:
 
   Http::StreamDecoderFilterCallbacks* decoder_callbacks_;
 
-  const std::string headerKey() const;
-  const std::string headerValue() const;
+  int n_thread() const;
+  const ModelPath modelPath() const;
 };
 
 using LLMInferenceFilterSharedPtr = std::shared_ptr<LLMInferenceFilter>;

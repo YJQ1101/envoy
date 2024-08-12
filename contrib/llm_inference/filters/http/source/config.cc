@@ -1,10 +1,6 @@
-#include "source/extensions/filters/http/llm_inference/config.h"
+#include "contrib/llm_inference/filters/http/source/config.h"
 
-// #include "envoy/registry/registry.h"
-#include "source/extensions/filters/http/llm_inference/llm_inference_filter.h"
-// #include "source/extensions/filters/http/llm_inference/config.h"
-// #include "source/extensions/filters/http/llm_inference/inference/inference_thread.h"
-// #include "source/extensions/filters/http/llm_inference/inference/inference_task.h"
+#include "contrib/llm_inference/filters/http/source/llm_inference_filter.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -46,7 +42,7 @@ private:
 SINGLETON_MANAGER_REGISTRATION(http_inference_singleton);
 
 Http::FilterFactoryCb LLMInferenceFilterConfigFactory::createFilterFactoryFromProtoTyped(
-    const envoy::extensions::filters::http::llm_inference::LLMInference& proto_config,
+    const envoy::extensions::filters::http::llm_inference::v3::modelParameter& proto_config,
     const std::string&, Server::Configuration::FactoryContext& context) {
 
     LLMInferenceFilterConfigSharedPtr config =
@@ -59,6 +55,13 @@ Http::FilterFactoryCb LLMInferenceFilterConfigFactory::createFilterFactoryFromPr
             });
     LLMInferenceTaskSharedPtr task = inference->get(inference, 1);
 
+    std::cout << "n_thread: " << config->n_thread()<< std::endl;
+
+    const auto a = modelPath();
+    for (const auto& pair : a) {
+      std::cout << pair.first << ": " << pair.second << std::endl;
+    }
+
     return [config, task](Http::FilterChainFactoryCallbacks& callbacks) -> void {
       callbacks.addStreamDecoderFilter(std::make_shared<LLMInferenceFilter>(config, task));
     };
@@ -66,9 +69,9 @@ Http::FilterFactoryCb LLMInferenceFilterConfigFactory::createFilterFactoryFromPr
 
 
 Router::RouteSpecificFilterConfigConstSharedPtr LLMInferenceFilterConfigFactory::createRouteSpecificFilterConfigTyped(
-    const envoy::extensions::filters::http::llm_inference::LLMInference& proto_config,
+    const envoy::extensions::filters::http::llm_inference::v3::modelChosen& proto_config,
     Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {
-    return std::make_shared<const LLMInferenceFilterConfig>(proto_config);
+    return std::make_shared<const LLMInferenceFilterConfigPerRoute>(proto_config);
 }
 
 /**
