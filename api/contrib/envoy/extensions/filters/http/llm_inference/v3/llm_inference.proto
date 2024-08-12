@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package envoy.extensions.filters.http.llm_inference;
+
+import "udpa/annotations/status.proto";
+import "validate/validate.proto";
+
+option (udpa.annotations.file_status).work_in_progress = true;
+
+message modelParameter {
+    int n_thread = 1;
+    map<string, string> modelName_to_modelPath = 2;
+}
+
+message modelInference {
+    repeated string useModel = 1;
+}

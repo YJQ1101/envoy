@@ -236,6 +236,18 @@ REPOSITORY_LOCATIONS_SPEC = dict(
         release_date = "2020-11-04",
         cpe = "N/A",
     ),
+    com_github_ggerganov_llama = dict(
+        project_name = "llama.cpp",
+        project_desc = "LLM inference in C/C++",
+        project_url = "https://github.com/ggerganov/llama.cpp",
+        version = "917dc8cfa67a72fb7c8bf7392270da3bf4833af4",
+        sha256 = "392c12b09a07f099eb45722da83ba2be441eb048af5d8197a94e917141f729ca",
+        strip_prefix = "llama.cpp-{version}",
+        urls = ["https://github.com/ggerganov/llama.cpp/archive/{version}.zip"],
+        use_category = ["dataplane_core"],
+        release_date = "2024-05-20",
+        cpe = "N/A",
+    ),
     com_github_gperftools_gperftools = dict(
         project_name = "gperftools",
         project_desc = "tcmalloc and profiling libraries",
