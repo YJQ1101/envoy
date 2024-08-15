@@ -4,6 +4,8 @@
 #include "contrib/envoy/extensions/filters/http/llm_inference/v3/llm_inference.pb.validate.h"
 
 #include "source/extensions/filters/http/common/factory_base.h"
+#include <string>
+#include <vector>
 
 namespace Envoy {
 namespace Extensions {
@@ -28,6 +30,8 @@ private:
   Router::RouteSpecificFilterConfigConstSharedPtr createRouteSpecificFilterConfigTyped(
       const envoy::extensions::filters::http::llm_inference::v3::modelChosen& proto_config,
       Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) override;
+  
+  std::vector<std::string> model_name_;
 };
 
 } // namespace LLMInference

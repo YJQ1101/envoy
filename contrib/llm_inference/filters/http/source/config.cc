@@ -1,6 +1,7 @@
 #include "contrib/llm_inference/filters/http/source/config.h"
 
 #include "contrib/llm_inference/filters/http/source/llm_inference_filter.h"
+#include <string>
 
 namespace Envoy {
 namespace Extensions {
@@ -12,19 +13,19 @@ public:
   InferenceSingleton(Thread::ThreadFactory& thread_factory)
       : inference_thread_(thread_factory) {}
 
-  std::shared_ptr<InferenceTask> get(std::shared_ptr<InferenceSingleton> singleton,
-                                           const int& id_task) {
-    std::shared_ptr<InferenceTask> task;
+  std::shared_ptr<InferenceContext> load(std::shared_ptr<InferenceSingleton> singleton, const int& n_thread,
+              const std::string& model_name , const std::string& model_path) {
+    std::shared_ptr<InferenceContext> ctx;
     absl::MutexLock lock(&mu_);
-    auto it = task_.find(id_task);
-    if (it != task_.end()) {
-      task = it->second.lock();
+    auto it = ctx_.find(model_name);
+    if (it != ctx_.end()) {
+      ctx = it->second.lock();
     }
-    if (!task) {
-      task = std::make_shared<InferenceTask>(singleton, inference_thread_);
-      task_[id_task] = task;
+    if (!ctx) {
+      ctx = std::make_shared<InferenceContext>(singleton, inference_thread_, n_thread, model_path, model_name);
+      ctx_[model_name] = ctx;
     }
-    return task;
+    return ctx;
   }
 
 private:
@@ -35,7 +36,7 @@ private:
   // that config of cache. The caches each keep shared_ptrs to this singleton, which keeps the
   // singleton from being destroyed unless it's no longer keeping track of any caches.
   // (The singleton shared_ptr is *only* held by cache instances.)
-  absl::flat_hash_map<int, std::weak_ptr<InferenceTask>> task_ ABSL_GUARDED_BY(mu_);
+  absl::flat_hash_map<std::string, std::weak_ptr<InferenceContext>> ctx_ ABSL_GUARDED_BY(mu_);
   // absl::flat_hash_map<std::string, std::weak_ptr<FileSystemHttpCache>> caches_ ABSL_GUARDED_BY(mu_);
 };
 
@@ -53,17 +54,21 @@ Http::FilterFactoryCb LLMInferenceFilterConfigFactory::createFilterFactoryFromPr
             SINGLETON_MANAGER_REGISTERED_NAME(http_inference_singleton), [&context] {
               return std::make_shared<InferenceSingleton>(context.api().threadFactory());
             });
-    LLMInferenceTaskSharedPtr task = inference->get(inference, 1);
 
-    std::cout << "n_thread: " << config->n_thread()<< std::endl;
+    InferenceContextSharedPtr ctx; //inference->load(inference, config->n_thread(), "qwen2", "/home/yuanjq/model/qwen2-7b-instruct-q5_k_m.gguf");
+    auto modelpath = config->modelPath();
+    for (const std::string& str: model_name_) {
+      std::cout << str << std::endl;
 
-    const auto a = modelPath();
-    for (const auto& pair : a) {
-      std::cout << pair.first << ": " << pair.second << std::endl;
+      if (modelpath.contains(str)) {
+        // std::cout << modelpath[str] << std::endl;
+
+        ctx = inference->load(inference, config->n_thread(), str, modelpath[str]);
+      }
     }
 
-    return [config, task](Http::FilterChainFactoryCallbacks& callbacks) -> void {
-      callbacks.addStreamDecoderFilter(std::make_shared<LLMInferenceFilter>(config, task));
+    return [config, ctx](Http::FilterChainFactoryCallbacks& callbacks) -> void {
+      callbacks.addStreamDecoderFilter(std::make_shared<LLMInferenceFilter>(config, ctx));
     };
 }
 
@@ -71,7 +76,13 @@ Http::FilterFactoryCb LLMInferenceFilterConfigFactory::createFilterFactoryFromPr
 Router::RouteSpecificFilterConfigConstSharedPtr LLMInferenceFilterConfigFactory::createRouteSpecificFilterConfigTyped(
     const envoy::extensions::filters::http::llm_inference::v3::modelChosen& proto_config,
     Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {
-    return std::make_shared<const LLMInferenceFilterConfigPerRoute>(proto_config);
+    LLMInferenceFilterConfigPerRouteSharedPtr config = 
+        std::make_shared<LLMInferenceFilterConfigPerRoute>(LLMInferenceFilterConfigPerRoute(proto_config));
+
+    for (const auto& str : config->modelChosen()) {
+        model_name_.push_back(str);
+    }
+    return config;
 }
 
 /**

@@ -16,6 +16,8 @@ namespace Extensions {
 namespace HttpFilters {
 namespace LLMInference {
 
+struct server_task;
+
 class InferenceThread{
 public:
   InferenceThread(Thread::ThreadFactory& thread_factory);

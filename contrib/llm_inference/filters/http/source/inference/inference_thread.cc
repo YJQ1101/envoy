@@ -1,6 +1,7 @@
 #include "contrib/llm_inference/filters/http/source/inference/inference_thread.h"
 
 #include "envoy/thread/thread.h"
+#include "inference_context.h"
 #include <algorithm>
 #include <cstdio>
 #include <unistd.h>

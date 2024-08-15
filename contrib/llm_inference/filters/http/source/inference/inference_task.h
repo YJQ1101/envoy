@@ -11,36 +11,20 @@ namespace LLMInference {
 
 // class InferenceContext;
 enum InferenceTaskType {
-  INFERENCETASKTYPE_CHAT_COMPLETION,
-  INFERENCETASKTYPE_EMBEDDINGS,
-  INFERENCETASKTYPE_DEFAULT,
+  InferencetasktypeTypeCompletion,
+  InferencetasktypeTypeEmbeedings,
+  InferencetasktypeTypeCancel,
 };
 
 struct InferenceTaskMetaData {
-  // InferenceTaskMetaData(const std::string&, InferenceTaskType);
+  InferenceTaskMetaData(const std::string&,bool,bool,int, InferenceTaskType,int);
   std::string data;
   InferenceTaskType type;
   bool infill    = false;
   bool embedding = false;
+  int id        = -1; 
+  int id_target = -1;
 };
-
-class InferenceTask {
-public:
-  InferenceTask(Envoy::Singleton::InstanceSharedPtr, InferenceThread&);
-  ~InferenceTask();
-  InferenceContextPtr makeInferenceContext();
-  void addTask(std::function<void(void)>);
-  void initstat(const std::string&, InferenceTaskType);
-  // void removeTask(std::shared_ptr<InferenceTaskMetaData>);
-  InferenceTaskMetaData task_meta_data_;
-
-private:
-  // A shared_ptr to keep the cache singleton alive as long as any of its caches are in use.
-  const Envoy::Singleton::InstanceSharedPtr owner_;
-  InferenceThread& inference_thread_;
-};
-
-using LLMInferenceTaskSharedPtr = std::shared_ptr<InferenceTask>;
 
 } // namespace LLMInference
 } // namespace HttpFilters

@@ -1,4 +1,5 @@
 #include "contrib/llm_inference/filters/http/source/inference/inference_task.h"
+#include "inference_context.h"
 #include <memory>
 
 namespace Envoy {
@@ -6,41 +7,8 @@ namespace Extensions {
 namespace HttpFilters {
 namespace LLMInference {
 
-void InferenceTask::initstat(const std::string& string_data, InferenceTaskType type) {
-  task_meta_data_.type = type;
-  task_meta_data_.data = string_data;
-  switch (type) {
-    case INFERENCETASKTYPE_CHAT_COMPLETION:
-      {
-        task_meta_data_.infill    = false;
-        task_meta_data_.embedding = false;
-      } break;
-    case INFERENCETASKTYPE_EMBEDDINGS:
-      {
-        task_meta_data_.infill    = false;
-        task_meta_data_.embedding = true;
-      } break;
-    case INFERENCETASKTYPE_DEFAULT:
-      break;
-  }
-}
-
-InferenceTask::InferenceTask(Singleton::InstanceSharedPtr owner, InferenceThread& inference_thread):
-    owner_(owner), inference_thread_(inference_thread){}
-
-InferenceTask::~InferenceTask() {}
-
-InferenceContextPtr InferenceTask::makeInferenceContext() {
-  return std::make_unique<InferenceContext>(*this, task_meta_data_);
-}
-
-void InferenceTask::addTask(std::function<void(void)> callback) {
-  inference_thread_.addTask(std::move(callback));
-}
-
-// void InferenceTask::removeTask(std::shared_ptr<InferenceTaskMetaData> task_meta_data) {
-//   inference_thread_.removeTask(task_meta_data);
-// }
+InferenceTaskMetaData::InferenceTaskMetaData(const std::string& data,bool infill,bool embe, int id, InferenceTaskType type, int id_target):
+  data(data), type(type),infill(infill), embedding(embe),id(id), id_target(id_target) {}
 
 } // namespace LLMInference
 } // namespace HttpFilters

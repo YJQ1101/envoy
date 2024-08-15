@@ -19,10 +19,19 @@ public:
 
   const int& n_thread() const {return n_thread_;}
   const ModelPath& modelPath() const {return modelPath_; }
+  const int& get_id() {
+    {
+      // absl::MutexLock lock(&mu_);
+      return ++id_task_;
+    }
+  }
 
 private:
   const int n_thread_;
   const ModelPath modelPath_;
+  int id_task_ = 0;
+  // ABSL_GUARDED_BY(mu_) = false;
+  // absl::Mutex mu_;
 };
 
 using LLMInferenceFilterConfigSharedPtr = std::shared_ptr<LLMInferenceFilterConfig>;
@@ -39,10 +48,12 @@ private:
   const ModelChosen modelChosen_;
 };
 
+using LLMInferenceFilterConfigPerRouteSharedPtr = std::shared_ptr<LLMInferenceFilterConfigPerRoute>;
+
 class LLMInferenceFilter : public Http::PassThroughDecoderFilter,
                            public std::enable_shared_from_this<LLMInferenceFilter> {
 public:
-  LLMInferenceFilter(LLMInferenceFilterConfigSharedPtr, LLMInferenceTaskSharedPtr);
+  LLMInferenceFilter(LLMInferenceFilterConfigSharedPtr, InferenceContextSharedPtr);
   ~LLMInferenceFilter();
 
   // Http::StreamFilterBase
@@ -57,22 +68,20 @@ public:
     decoder_callbacks_ = &callbacks;
   }
 
-  void getHeaders();
-  void onHeaders(LoadModelResult&& result);
-  void getBody();
+  void getHeaders(std::shared_ptr<InferenceTaskMetaData>&&);
   void onBody(ModelInferenceResult&&);
 
 private:
   const LLMInferenceFilterConfigSharedPtr config_;
-  const LLMInferenceTaskSharedPtr task_;
+  const InferenceContextSharedPtr ctx_;
 
-  InferenceContextPtr ctx_;
-  InferenceTaskType task_type_ = INFERENCETASKTYPE_DEFAULT;
+  // InferenceTaskType task_type_ = INFERENCETASKTYPE_DEFAULT;
 
   Http::StreamDecoderFilterCallbacks* decoder_callbacks_;
-
+  int id_task_;
   int n_thread() const;
   const ModelPath modelPath() const;
+  int get_id() const;
 };
 
 using LLMInferenceFilterSharedPtr = std::shared_ptr<LLMInferenceFilter>;

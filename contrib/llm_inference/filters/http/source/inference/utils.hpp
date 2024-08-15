@@ -17,6 +17,17 @@ namespace LLMInference {
 
 using json = nlohmann::ordered_json;
 
+enum server_task_type {
+    SERVER_TASK_TYPE_COMPLETION,
+    SERVER_TASK_TYPE_CANCEL,
+    SERVER_TASK_TYPE_NEXT_RESPONSE,
+};
+
+enum stop_type {
+    STOP_TYPE_FULL,
+    STOP_TYPE_PARTIAL,
+};
+
 struct slot_params {
     bool stream       = true;
     bool cache_prompt = false; // remember the prompt to avoid reprocessing all prompt
@@ -31,6 +42,17 @@ struct slot_params {
     json input_suffix;
 };
 
+enum slot_state {
+    SLOT_STATE_IDLE,
+    SLOT_STATE_PROCESSING,
+};
+
+enum slot_command {
+    SLOT_COMMAND_NONE,
+    SLOT_COMMAND_LOAD_PROMPT,
+    SLOT_COMMAND_RELEASE,
+};
+
 struct completion_token_output {
     llama_token tok;
     std::string text_to_send;
@@ -43,14 +65,69 @@ struct completion_token_output {
     std::vector<token_prob> probs;
 };
 
+#define LOG_ERROR(  MSG, ...) server_log("ERR",  __func__, __LINE__, MSG, __VA_ARGS__)
+#define LOG_WARNING(MSG, ...) server_log("WARN", __func__, __LINE__, MSG, __VA_ARGS__)
+#define LOG_INFO(   MSG, ...) server_log("INFO", __func__, __LINE__, MSG, __VA_ARGS__)
+
+static inline void server_log(const char * level, const char * function, int line, const char * message, const json & extra);
+
 template <typename T>
-static T json_value(const json & body, const std::string & key, const T& default_value) {
+static T json_value(const json & body, const std::string & key, const T & default_value) {
     // Fallback null to default value
     if (body.contains(key) && !body.at(key).is_null()) {
-        return body.at(key);
+        try {
+            return body.at(key);
+        } catch (NLOHMANN_JSON_NAMESPACE::detail::type_error const &) {
+            std::stringstream ss;
+            ss << "Wrong type supplied for parameter '" << key << "'. Expected '" << json(default_value).type_name() << "', using default value.";
+            LOG_WARNING(ss.str().c_str(), body);
+            return default_value;
+        }
     } else {
         return default_value;
     }
+}
+
+static inline void server_log(const char * level, const char * function, int line, const char * message, const json & extra) {
+    std::stringstream ss_tid;
+    ss_tid << std::this_thread::get_id();
+    json log = json{
+        {"tid",       ss_tid.str()},
+        {"timestamp", time(nullptr)},
+    };
+
+    if (1) {
+        log.merge_patch({
+            {"level",    level},
+            {"function", function},
+            {"line",     line},
+            {"msg",      message},
+        });
+
+        if (!extra.empty()) {
+            log.merge_patch(extra);
+        }
+
+        printf("%s\n", log.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
+    } else {
+        char buf[1024];
+        snprintf(buf, 1024, "%4s [%24s] %s", level, function, message);
+
+        if (!extra.empty()) {
+            log.merge_patch(extra);
+        }
+        std::stringstream ss;
+        ss << buf << " |";
+        for (const auto & el : log.items())
+        {
+            const std::string value = el.value().dump(-1, ' ', false, json::error_handler_t::replace);
+            ss << " " << el.key() << "=" << value;
+        }
+
+        const std::string str = ss.str();
+        printf("%.*s\n", static_cast<int>(str.size()), str.data());
+    }
+    fflush(stdout);
 }
 
 // Format given chat. If tmpl is empty, we take the template from model metadata
@@ -109,6 +186,13 @@ static std::string gen_chatcmplid() {
     chatcmplid << "chatcmpl-" << random_string();
 
     return chatcmplid.str();
+}
+
+static size_t common_part(const std::vector<llama_token> & a, const std::vector<llama_token> & b) {
+    size_t i;
+    for (i = 0; i < a.size() && i < b.size() && a[i] == b[i]; i++) {}
+
+    return i;
 }
 
 // format incomplete utf-8 multibyte character for output
@@ -258,7 +342,7 @@ static size_t find_partial_stop_string(const std::string &stop, const std::strin
     return std::string::npos;
 }
 
-static json format_final_response_oaicompat(const json & request, json result, const std::string & completion_id, bool streaming = false) {
+static json format_final_response_oaicompat(const std::string& model_name, json result, const std::string & completion_id, bool streaming = false) {
     bool stopped_word        = result.count("stopped_word") != 0;
     bool stopped_eos         = json_value(result, "stopped_eos", false);
     int num_tokens_predicted = json_value(result, "tokens_predicted", 0);
@@ -284,8 +368,7 @@ static json format_final_response_oaicompat(const json & request, json result, c
     json res = json {
         {"choices", choices},
         {"created", t},
-        {"model",
-            json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
+        {"model", model_name},
         {"object", streaming ? "chat.completion.chunk" : "chat.completion"},
         {"usage", json {
             {"completion_tokens", num_tokens_predicted},
@@ -399,6 +482,30 @@ static std::vector<json> format_partial_response_oaicompat(json result, const st
     }
 
     return std::vector<json>({ret});
+}
+
+static json format_embeddings_response_oaicompat(const std::string& model_name, const json & embeddings) {
+    json data = json::array();
+    int i = 0;
+    for (auto & elem : embeddings) {
+        data.push_back(json{
+            {"embedding", json_value(elem, "embedding", json::array())},
+            {"index",     i++},
+            {"object",    "embedding"}
+        });
+    }
+
+    json res = json {
+        {"model", model_name},
+        {"object", "list"},
+        {"usage", json {
+            {"prompt_tokens", 0},
+            {"total_tokens", 0}
+        }},
+        {"data", data}
+    };
+
+    return res;
 }
 
 } // namespace LLMInference
