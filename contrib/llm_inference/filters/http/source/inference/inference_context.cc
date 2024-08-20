@@ -4,8 +4,8 @@
 #include "common/grammar-parser.cpp"
 #include "utils.hpp"
 #include "contrib/llm_inference/filters/http/source/inference/inference_context.h"
-#include "contrib/llm_inference/filters/http/source/inference/inference_task.h"
 #include <cstdio>
+#include <llama.h>
 #include <memory>
 
 char const *LLAMA_COMMIT = "123";
@@ -80,11 +80,11 @@ struct server_slot {
     size_t n_sent_text = 0; // number of sent text character
     size_t n_sent_token_probs = 0;
 
-    // int64_t t_start_process_prompt;
-    // int64_t t_start_generation;
+    int64_t t_start_process_prompt;
+    int64_t t_start_generation;
 
-    // double t_prompt_processing; // ms
-    // double t_token_generation; // ms
+    double t_prompt_processing; // ms
+    double t_token_generation; // ms
 
     void reset() {
         n_prompt_tokens    = 0;
@@ -137,9 +137,23 @@ struct server_slot {
 
     void release() {
         if (state == SLOT_STATE_PROCESSING) {
-            // t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
+            t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
             command = SLOT_COMMAND_RELEASE;
         }
+    }
+
+    json get_formated_timings() const {
+        return json {
+            {"prompt_n",               n_prompt_tokens_processed},
+            {"prompt_ms",              t_prompt_processing},
+            {"prompt_per_token_ms",    t_prompt_processing / n_prompt_tokens_processed},
+            {"prompt_per_second",      1e3 / t_prompt_processing * n_prompt_tokens_processed},
+
+            {"predicted_n",            n_decoded},
+            {"predicted_ms",           t_token_generation},
+            {"predicted_per_token_ms", t_token_generation / n_decoded},
+            {"predicted_per_second",   1e3 / t_token_generation * n_decoded},
+        };
     }
 
     size_t find_stopping_strings(const std::string & text, const size_t last_token_size, const stop_type type) {
@@ -169,6 +183,52 @@ struct server_slot {
 
         return stop_pos;
     }
+
+    void print_timings() const {
+        char buffer[512];
+
+        double t_token = t_prompt_processing / n_prompt_tokens_processed;
+        double n_tokens_second = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+
+        snprintf(buffer, 512, "prompt eval time     = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)",
+                t_prompt_processing, n_prompt_tokens_processed,
+                t_token, n_tokens_second);
+
+        LOG_INFO(buffer, {
+            {"id_slot",                   id},
+            {"id_task",                   id_task},
+            {"t_prompt_processing",       t_prompt_processing},
+            {"n_prompt_tokens_processed", n_prompt_tokens_processed},
+            {"t_token",                   t_token},
+            {"n_tokens_second",           n_tokens_second},
+        });
+
+        t_token = t_token_generation / n_decoded;
+        n_tokens_second = 1e3 / t_token_generation * n_decoded;
+
+        snprintf(buffer, 512, "generation eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)",
+                t_token_generation, n_decoded,
+                t_token, n_tokens_second);
+
+        LOG_INFO(buffer, {
+            {"id_slot",            id},
+            {"id_task",            id_task},
+            {"t_token_generation", t_token_generation},
+            {"n_decoded",          n_decoded},
+            {"t_token",            t_token},
+            {"n_tokens_second",    n_tokens_second},
+        });
+
+        snprintf(buffer, 512, "          total time = %10.2f ms", t_prompt_processing + t_token_generation);
+
+        LOG_INFO(buffer, {
+            {"id_slot",             id},
+            {"id_task",             id_task},
+            {"t_prompt_processing", t_prompt_processing},
+            {"t_token_generation",  t_token_generation},
+            {"t_total",             t_prompt_processing + t_token_generation},
+        });
+    }
 };
 
 struct server_task {
@@ -182,46 +242,73 @@ struct server_task {
     bool embedding = false;
 };
 
+void server_metrics::on_prompt_eval(const server_slot & slot) {
+  n_prompt_tokens_processed_total += slot.n_prompt_tokens_processed;
+  n_prompt_tokens_processed       += slot.n_prompt_tokens_processed;
+  t_prompt_processing             += slot.t_prompt_processing;
+  t_prompt_processing_total       += slot.t_prompt_processing;
+}
+
+void server_metrics::on_prediction(const server_slot & slot) {
+  n_tokens_predicted_total   += slot.n_decoded;
+  n_tokens_predicted         += slot.n_decoded;
+  t_tokens_generation        += slot.t_token_generation;
+  t_tokens_generation_total  += slot.t_token_generation;
+}
+
+void server_metrics::reset_bucket() {
+  n_prompt_tokens_processed = 0;
+  t_prompt_processing       = 0;
+  n_tokens_predicted        = 0;
+  t_tokens_generation       = 0;
+}
+
 InferenceContext::InferenceContext(Singleton::InstanceSharedPtr owner, InferenceThread& inference_thread, 
-          const int& n_thread, const std::string& model_path, const std::string& model_name):owner_(owner),
+          const ModelParameter& model_parameter, const std::string& model_path, const std::string& model_name):owner_(owner),
            inference_thread_(inference_thread), model_name_(model_name) {
-  inference_thread_.addTask([this, n_thread, model_path](){
-    this->loadModel(n_thread, model_path);
-  });
+  // inference_thread_.addTask([this, n_thread, model_path](){
+  //   this->loadModel(n_thread, model_path);
+  // });
+  loadModel(model_parameter, model_path);
 }
 
 InferenceContext::~InferenceContext() {
-  if (ctx_) {
-    llama_kv_cache_clear(ctx_);
-    llama_free(ctx_);
-    ctx_ = nullptr;
+  std::cout << "InferenceContext free" << std::endl;
+
+  llama_kv_cache_clear(ctx);
+  if (ctx) {
+    llama_free(ctx);
+    ctx = nullptr;
   }
 
-  if (model_) {
-    llama_free_model(model_);
-    model_ = nullptr;
+  if (model) {
+    llama_free_model(model);
+    model = nullptr;
   }
 
   // Clear any sampling context
-  for (server_slot & slot : slots_) {
+  for (server_slot & slot : slots) {
     if (slot.ctx_sampling != nullptr) {
         llama_sampling_free(slot.ctx_sampling);
     }
   }
-  llama_batch_free(batch_);
+  llama_batch_free(batch);
   llama_backend_free();
 }
 
-bool InferenceContext::loadModel(const int& n_thread, const std::string& model_path) {
-  params.n_parallel = n_thread;
+int InferenceContext::getId() {
+  return inference_thread_.getId();
+}
+
+bool InferenceContext::loadModel(const ModelParameter& model_parameter, const std::string& model_path) {
+  // gpt_params params;
+  params.n_threads = model_parameter.n_threads;
+  params.n_parallel = model_parameter.n_parallel;
+  params.embedding = model_parameter.embedding;
+
   params.model = model_path;
-
+  
   gpt_params_handle_model_default(params);
-
-  if (!params.kv_overrides.empty()) {
-    params.kv_overrides.emplace_back();
-    params.kv_overrides.back().key[0] = 0;
-  }
 
   if (params.model_alias == "unknown") {
     params.model_alias = params.model;
@@ -233,18 +320,18 @@ bool InferenceContext::loadModel(const int& n_thread, const std::string& model_p
   {
     // dedicate one sequence to the system prompt
     params.n_parallel += 1;
-    std::tie(model_, ctx_) = llama_init_from_gpt_params(params);
+    std::tie(model, ctx) = llama_init_from_gpt_params(params);
     params.n_parallel -= 1; // but be sneaky about it
-    if (model_ == nullptr) {
+    if (model == nullptr) {
       return false;
     }
-    n_ctx_ = llama_n_ctx(ctx_);
-    add_bos_token_ = llama_should_add_bos_token(model_);
-    GGML_ASSERT(llama_add_eos_token(model_) != 1);
+    n_ctx = llama_n_ctx(ctx);
+    add_bos_token = llama_should_add_bos_token(model);
+    GGML_ASSERT(llama_add_eos_token(model) != 1);
   }
   // init slot
   {
-    const int32_t n_ctx_slot = n_ctx_ / params.n_parallel;
+    const int32_t n_ctx_slot = n_ctx / params.n_parallel;
 
     LOG_INFO("initializing slots", {{"n_slots", params.n_parallel}});
 
@@ -255,11 +342,21 @@ bool InferenceContext::loadModel(const int& n_thread, const std::string& model_p
       slot.n_ctx = n_ctx_slot;
       slot.n_predict = params.n_predict;
 
+      LOG_INFO("new slot", {
+        {"id_slot",    slot.id},
+        {"n_ctx_slot", slot.n_ctx}
+      });
+
       const int ga_n = params.grp_attn_n;
       const int ga_w = params.grp_attn_w;
       if (ga_n != 1) {
         GGML_ASSERT(ga_n > 0                    && "ga_n must be positive");                       // NOLINT
         GGML_ASSERT(ga_w % ga_n == 0            && "ga_w must be a multiple of ga_n");             // NOLINT
+        LOG_INFO("slot self-extend", {
+          {"id_slot", slot.id},
+          {"ga_n",    ga_n},
+          {"ga_w",    ga_w}
+        });
       }
       slot.ga_i = 0;
       slot.ga_n = ga_n;
@@ -267,24 +364,28 @@ bool InferenceContext::loadModel(const int& n_thread, const std::string& model_p
 
       slot.reset();
 
-      slots_.push_back(slot);
+      slots.push_back(slot);
 
       // the update_slots() logic will always submit a maximum of n_batch tokens
       // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
       {
-        const int32_t n_batch = llama_n_batch(ctx_);
+        const int32_t n_batch = llama_n_batch(ctx);
 
         // only a single seq_id per token is needed
-        batch_ = llama_batch_init(n_batch, 0, 1);
+        batch = llama_batch_init(n_batch, 0, 1);
       }
+
+      metrics.init();
     }
   }
-    
+
+  LOG_INFO("model loaded", {});
+
   // if a custom chat template is not supplied, we will use the one that comes with the model (if any)
   {
     llama_chat_message chat[] = {{"user", "test"}};
 
-    if (llama_chat_apply_template(model_, nullptr, chat, 1, true, nullptr, 0) <= 0) {
+    if (!(llama_chat_apply_template(model, nullptr, chat, 1, true, nullptr, 0) > 0)) {
       LOG_ERROR("The chat template that comes with this model is not yet supported, falling back to chatml. This may cause the model to output suboptimal responses", {});
       chat_template_ = "chatml";
     }
@@ -342,7 +443,7 @@ std::vector<llama_token> tokenize(llama_context *ctx, const json & json_prompt, 
 
 bool InferenceContext::processToken(completion_token_output & result, server_slot & slot) {
   // remember which tokens were sampled - used for repetition penalties during sampling
-  const std::string token_str = llama_token_to_piece(ctx_, result.tok, false);
+  const std::string token_str = llama_token_to_piece(ctx, result.tok, false);
   slot.sampled = result.tok;
 
   // search stop word and delete it
@@ -420,14 +521,13 @@ bool InferenceContext::processToken(completion_token_output & result, server_slo
     slot.has_next_token = false;
   }
 
-  if (llama_token_is_eog(model_, result.tok)) {
+  if (llama_token_is_eog(model, result.tok)) {
     slot.stopped_eos    = true;
     slot.has_next_token = false;
   }
 
-  auto n_ctx_train = llama_n_ctx_train(model_);
-
-  if (slot.params.n_predict < 1 && slot.n_predict < 1
+  auto n_ctx_train = llama_n_ctx_train(model);
+  if (slot.params.n_predict < 1 && slot.n_predict < 1 && slot.ga_n == 1
         && slot.n_prompt_tokens + slot.n_decoded >= n_ctx_train) {
     slot.truncated      = true;
     slot.stopped_limit  = true;
@@ -439,7 +539,7 @@ bool InferenceContext::processToken(completion_token_output & result, server_slo
 
 void InferenceContext::updateSlots() {
   // release slots
-  for (auto & slot : slots_) {
+  for (auto & slot : slots) {
     if (slot.command == SLOT_COMMAND_RELEASE) {
       slot.state       = SLOT_STATE_IDLE;
       slot.command     = SLOT_COMMAND_NONE;
@@ -451,7 +551,7 @@ void InferenceContext::updateSlots() {
   {
     bool all_idle = true;
 
-    for (auto & slot : slots_) {
+    for (auto & slot : slots) {
       if (slot.state != SLOT_STATE_IDLE || slot.command != SLOT_COMMAND_NONE) {
         all_idle = false;
         break;
@@ -459,10 +559,10 @@ void InferenceContext::updateSlots() {
     }
 
     if (all_idle) {
-      if (clean_kv_cache_) {
+      LOG_INFO("all slots are idle", {});
+      if (system_prompt.empty() && clean_kv_cache) {
         // clear the entire KV cache
-        llama_kv_cache_clear(ctx_);
-        clean_kv_cache_ = false;
+        llama_kv_cache_clear(ctx);
       }
       return;
     }
@@ -470,67 +570,29 @@ void InferenceContext::updateSlots() {
   {
     server_task task;
     task.type      = SERVER_TASK_TYPE_NEXT_RESPONSE;
+    task.id_target = -1;
+    task.id = getId();
     inference_thread_.addTask([this, task](){
       this->processSingleTask(task);
     });
   }
 
-  // apply context-shift if needed
-  // TODO: simplify and improve
-  for (server_slot & slot : slots_) {
-    if (slot.ga_n == 1) {
-      if (slot.is_processing() && slot.n_past >= slot.n_ctx - 1) {
-        // Shift context
-        const int n_keep    = slot.params.n_keep + add_bos_token_;
-        const int n_left    = slot.n_past - n_keep;
-        const int n_discard = slot.params.n_discard ? slot.params.n_discard : (n_left / 2);
-
-        LOG_INFO("slot context shift", {
-          {"id_slot",         slot.id},
-          {"id_task",         slot.id_task},
-          {"n_keep",          n_keep},
-          {"n_left",          n_left},
-          {"n_discard",       n_discard},
-          {"n_ctx",           n_ctx_},
-          {"n_past",          slot.n_past},
-          // {"n_system_tokens", system_tokens.size()},
-          {"n_cache_tokens",  slot.cache_tokens.size()}
-        });
-
-        llama_kv_cache_seq_rm (ctx_, slot.id + 1, n_keep            , n_keep + n_discard);
-        llama_kv_cache_seq_add(ctx_, slot.id + 1, n_keep + n_discard, slot.n_past, -n_discard);
-
-        if (slot.params.cache_prompt) {
-          for (size_t i = n_keep + n_discard; i < slot.cache_tokens.size(); i++) {
-            slot.cache_tokens[i - n_discard] = slot.cache_tokens[i];
-          }
-
-          slot.cache_tokens.resize(slot.cache_tokens.size() - n_discard);
-        }
-
-        slot.n_past -= n_discard;
-
-        slot.truncated = true;
-      }
-    }
-  }
-
   // start populating the batch for this iteration
-  llama_batch_clear(batch_);
+  llama_batch_clear(batch);
 
   // frist, add sampled tokens from any ongoing sequences
-  for (auto & slot : slots_) {
+  for (auto & slot : slots) {
     if (slot.state == SLOT_STATE_IDLE) {
       continue;
     }
-
-    slot.i_batch = batch_.n_tokens;
+    // std::cout << "fuck" <<  slot.id << std::endl;
+    slot.i_batch = batch.n_tokens;
 
     const int32_t slot_npast = slot.n_past_se > 0 ? slot.n_past_se : slot.n_past;
 
     // TODO: we always have to take into account the "system_tokens"
     //       this is not great and needs to be improved somehow
-    llama_batch_add(batch_, slot.sampled, slot_npast, { slot.id + 1 }, true);
+    llama_batch_add(batch, slot.sampled, system_tokens.size() + slot_npast, { slot.id + 1 }, true);
 
     slot.n_past += 1;
 
@@ -540,41 +602,45 @@ void InferenceContext::updateSlots() {
   }
 
   // process in chunks of params.n_batch
-  int32_t n_batch  = llama_n_batch(ctx_);
-  int32_t n_ubatch = llama_n_ubatch(ctx_);
+
+  int32_t n_batch  = llama_n_batch(ctx);
+  int32_t n_ubatch = llama_n_ubatch(ctx);
 
   // next, batch any pending prompts without exceeding n_batch
-  if (params.cont_batching || batch_.n_tokens == 0) {
-    for (auto & slot : slots_) {
+    for (auto & slot : slots) {
       // this slot still has a prompt to be processed
       if (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT) {
         auto & prompt_tokens = slot.prompt_tokens;
 
         // we haven't tokenized the prompt yet - do it now:
         if (prompt_tokens.empty()) {
+
+          slot.t_start_process_prompt = ggml_time_us();
+          slot.t_start_generation = 0;
+
           if (slot.infill) {
             bool suff_rm_leading_spc = true;
-            if (params.input_suffix.find_first_of(' ') == 0 && params.input_suffix.size() > 1) {
-              params.input_suffix.erase(0, 1);
-              suff_rm_leading_spc = false;
-            }
+            // if (params.input_suffix.find_first_of(' ') == 0 && params.input_suffix.size() > 1) {
+            //   params.input_suffix.erase(0, 1);
+            //   suff_rm_leading_spc = false;
+            // }
 
-            auto prefix_tokens = tokenize(ctx_, slot.params.input_prefix, false); // maybe thisway
-            auto suffix_tokens = tokenize(ctx_, slot.params.input_suffix, false);
+            auto prefix_tokens = tokenize(ctx, slot.params.input_prefix, false);
+            auto suffix_tokens = tokenize(ctx, slot.params.input_suffix, false);
 
             const int space_token = 29871; // TODO: this should not be hardcoded
             if (suff_rm_leading_spc && !suffix_tokens.empty() && suffix_tokens[0] == space_token) {
               suffix_tokens.erase(suffix_tokens.begin());
             }
 
-            prefix_tokens.insert(prefix_tokens.begin(), llama_token_prefix(model_));
-            prefix_tokens.insert(prefix_tokens.begin(), llama_token_bos(model_)); // always add BOS
-            prefix_tokens.insert(prefix_tokens.end(),   llama_token_suffix(model_));
+            prefix_tokens.insert(prefix_tokens.begin(), llama_token_prefix(model));
+            prefix_tokens.insert(prefix_tokens.begin(), llama_token_bos(model)); // always add BOS
+            prefix_tokens.insert(prefix_tokens.end(),   llama_token_suffix(model));
             prefix_tokens.insert(prefix_tokens.end(),   suffix_tokens.begin(), suffix_tokens.end());
-            prefix_tokens.push_back(llama_token_middle(model_));
+            prefix_tokens.push_back(llama_token_middle(model));
             prompt_tokens = prefix_tokens;
           } else {
-            prompt_tokens = tokenize(ctx_, slot.prompt, true); // add BOS if there isn't system prompt
+            prompt_tokens = tokenize(ctx, slot.prompt, system_prompt.empty()); // add BOS if there isn't system prompt
           }
 
           slot.n_past = 0;
@@ -589,6 +655,7 @@ void InferenceContext::updateSlots() {
             slot.state = SLOT_STATE_PROCESSING;
             slot.command = SLOT_COMMAND_NONE;
             slot.release();
+            slot.print_timings();
             sendFinalResponse(slot);
             continue;
           }
@@ -645,7 +712,7 @@ void InferenceContext::updateSlots() {
 
               // push the prompt into the sampling context (do not apply grammar)
               for (int i = 0; i < slot.n_past; ++i) {
-                llama_sampling_accept(slot.ctx_sampling, ctx_, slot.cache_tokens[i], false);
+                llama_sampling_accept(slot.ctx_sampling, ctx, slot.cache_tokens[i], false);
               }
             }
           }
@@ -668,22 +735,22 @@ void InferenceContext::updateSlots() {
 
         if (slot.embedding) {
           // cannot fit the prompt in the current batch - will try next iter
-          if (batch_.n_tokens + slot.n_prompt_tokens > n_batch) {
+          if (batch.n_tokens + slot.n_prompt_tokens > n_batch) {
             continue;
           }
         }
 
         // keep only the common part
-        int p0 = slot.n_past;
-        if (!llama_kv_cache_seq_rm(ctx_, slot.id + 1, p0, -1)) {
+        int p0 = static_cast<int>(system_tokens.size()) + slot.n_past;
+        if (!llama_kv_cache_seq_rm(ctx, slot.id + 1, p0, -1)) {
           // could not partially delete (likely using a non-Transformer model)
-          llama_kv_cache_seq_rm(ctx_, slot.id + 1, -1, -1);
+          llama_kv_cache_seq_rm(ctx, slot.id + 1, -1, -1);
 
-          // p0 = 0;
-          // if (p0 != 0) {
-          //   // copy over the system prompt when there is one
-          //   llama_kv_cache_seq_cp(ctx_, 0, slot.id + 1, -1, -1);
-          // }
+          p0 = static_cast<int>(system_tokens.size());
+          if (p0 != 0) {
+            // copy over the system prompt when there is one
+            llama_kv_cache_seq_cp(ctx, 0, slot.id + 1, -1, -1);
+          }
 
           // there is no common part left (except for the system prompt)
           slot.n_past = 0;
@@ -695,7 +762,11 @@ void InferenceContext::updateSlots() {
 
         // remove the non-common part from the cache
         slot.cache_tokens.resize(slot.n_past);
-
+        LOG_INFO("kv cache rm [p0, end)", {
+            { "id_slot", slot.id },
+            { "id_task", slot.id_task },
+            { "p0",      p0 }
+        });
         int32_t slot_npast = slot.n_past_se > 0 ? slot.n_past_se : slot.n_past;
 
         int32_t ga_i = slot.ga_i;
@@ -704,7 +775,7 @@ void InferenceContext::updateSlots() {
 
         // add prompt tokens for processing in the current batch
         // TODO: the self-extend stuff here is a mess - simplify and/or abstract it somehow
-        for (; slot.n_past < slot.n_prompt_tokens && batch_.n_tokens < n_batch; ++slot.n_past) {
+        for (; slot.n_past < slot.n_prompt_tokens && batch.n_tokens < n_batch; ++slot.n_past) {
           if (slot.ga_n != 1) {
             while (slot_npast >= ga_i + ga_w) {
               const int bd = (ga_w/ga_n)*(ga_n - 1);
@@ -713,7 +784,7 @@ void InferenceContext::updateSlots() {
             }
           }
 
-          llama_batch_add(batch_, prompt_tokens[slot.n_past], slot_npast, { slot.id + 1 }, false);
+          llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false);
 
           if (slot.params.cache_prompt) {
             slot.cache_tokens.push_back(prompt_tokens[slot.n_past]);
@@ -728,30 +799,29 @@ void InferenceContext::updateSlots() {
           slot.state   = SLOT_STATE_PROCESSING;
           slot.command = SLOT_COMMAND_NONE;
 
-          GGML_ASSERT(batch_.n_tokens > 0);
+          GGML_ASSERT(batch.n_tokens > 0);
 
           // extract the logits only for the last token
-          batch_.logits[batch_.n_tokens - 1] = true;
+          batch.logits[batch.n_tokens - 1] = true;
 
           slot.n_decoded = 0;
-          slot.i_batch   = batch_.n_tokens - 1;
+          slot.i_batch   = batch.n_tokens - 1;
         }
       }
 
-      if (batch_.n_tokens >= n_batch) {
+      if (batch.n_tokens >= n_batch) {
         break;
       }
     }
-  }
 
-  if (batch_.n_tokens == 0) {
+  if (batch.n_tokens == 0) {
     return;
   }
-
   // process the created batch of tokens
-  for (int32_t i = 0; i < batch_.n_tokens; i += n_batch) {
-    const int32_t n_tokens = std::min(n_batch, batch_.n_tokens - i);
-    for (auto & slot : slots_) {
+
+  for (int32_t i = 0; i < batch.n_tokens; i += n_batch) {
+    const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+    for (auto & slot : slots) {
       if (slot.ga_n != 1) {
         // context extension via Self-Extend
         // TODO: simplify and/or abstract this
@@ -765,9 +835,9 @@ void InferenceContext::updateSlots() {
           LOG_TEE("div:   [%6d, %6d] / %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n, (slot.ga_i + ib * bd) / slot.ga_n, (slot.ga_i + ib * bd + slot.ga_w) / slot.ga_n);
           LOG_TEE("shift: [%6d, %6d] + %6d -> [%6d, %6d]\n", slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd, slot.ga_i + ib * bd + slot.ga_w + dd, slot.n_past_se + ib * bd + dd);
 
-          llama_kv_cache_seq_add(ctx_, slot.id + 1, slot.ga_i, slot.n_past_se, ib * bd);
-          llama_kv_cache_seq_div(ctx_, slot.id + 1, slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
-          llama_kv_cache_seq_add(ctx_, slot.id + 1, slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
+          llama_kv_cache_seq_add(ctx, slot.id + 1, slot.ga_i, slot.n_past_se, ib * bd);
+          llama_kv_cache_seq_div(ctx, slot.id + 1, slot.ga_i + ib * bd, slot.ga_i + ib * bd + slot.ga_w, slot.ga_n);
+          llama_kv_cache_seq_add(ctx, slot.id + 1, slot.ga_i + ib * bd + slot.ga_w, slot.n_past_se + ib * bd, dd);
 
           slot.n_past_se -= bd;
 
@@ -780,24 +850,24 @@ void InferenceContext::updateSlots() {
       }
     }
 
-    llama_batch batch_view = {
+    llama_batch batch_view =
+    {
       n_tokens,
-      batch_.token    + i,
+      batch.token    + i,
       nullptr,
-      batch_.pos      + i,
-      batch_.n_seq_id + i,
-      batch_.seq_id   + i,
-      batch_.logits   + i,
+      batch.pos      + i,
+      batch.n_seq_id + i,
+      batch.seq_id   + i,
+      batch.logits   + i,
       0, 0, 0, // unused
     };
 
-
-    const int ret = llama_decode(ctx_, batch_view);
+    const int ret = llama_decode(ctx, batch_view);
   
     if (ret != 0) {
       if (n_batch == 1 || ret < 0) {
 
-        for (auto & slot : slots_) {
+        for (auto & slot : slots) {
           slot.state = SLOT_STATE_PROCESSING;
           slot.command = SLOT_COMMAND_NONE;
           slot.release();
@@ -813,8 +883,8 @@ void InferenceContext::updateSlots() {
       continue; // continue loop of n_batch
     }
 
-    for (auto & slot : slots_) {
-      if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch < i || slot.i_batch >= (i + n_tokens)) {
+    for (auto & slot : slots) {
+      if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch < static_cast<int>(i) || slot.i_batch >= static_cast<int>(i + n_tokens)) {
         continue; // continue loop of slots
       }
 
@@ -827,16 +897,17 @@ void InferenceContext::updateSlots() {
       }
 
       completion_token_output result;
-      const llama_token id = llama_sampling_sample(slot.ctx_sampling, ctx_, nullptr, slot.i_batch - i);
 
-      llama_sampling_accept(slot.ctx_sampling, ctx_, id, true);
+      const llama_token id = llama_sampling_sample(slot.ctx_sampling, ctx, nullptr, slot.i_batch - i);
+
+      llama_sampling_accept(slot.ctx_sampling, ctx, id, true);
       
       slot.n_decoded += 1;
-      // if (slot.n_decoded == 1) {
-          // slot.t_start_generation = ggml_time_us();
-          // slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-          // metrics.on_prompt_eval(slot);
-      // }
+      if (slot.n_decoded == 1) {
+          slot.t_start_generation = ggml_time_us();
+          slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+          metrics.on_prompt_eval(slot);
+      }
 
       llama_token_data_array cur_p = { slot.ctx_sampling->cur.data(), slot.ctx_sampling->cur.size(), false };
       result.tok = id;
@@ -847,7 +918,7 @@ void InferenceContext::updateSlots() {
 
         // Make sure at least n_probs top tokens are at the front of the vector:
         if (slot.sparams.temp == 0.0f && n_probs > n_valid) {
-          llama_sample_top_k(ctx_, &cur_p, n_probs, 0);
+          llama_sample_top_k(ctx, &cur_p, n_probs, 0);
         }
 
         if (slot.sparams.temp == 0.0f) {
@@ -870,12 +941,15 @@ void InferenceContext::updateSlots() {
 
       if (!processToken(result, slot)) {
         slot.release();
+        slot.print_timings();
         sendFinalResponse(slot);
+        metrics.on_prediction(slot);
       }
 
       slot.i_batch = -1;
     }
   }
+
 }
 
 bool InferenceContext::launchSlotWithTask(server_slot & slot, const server_task & task) {
@@ -915,6 +989,22 @@ bool InferenceContext::launchSlotWithTask(server_slot & slot, const server_task 
   slot.sparams.n_probs           = json_value(data, "n_probs",           default_sparams.n_probs);
   slot.sparams.min_keep          = json_value(data, "min_keep",          default_sparams.min_keep);
 
+  // process "json_schema" and "grammar"
+  if (data.contains("json_schema") && !data.at("json_schema").is_null() && data.contains("grammar") && !data.at("grammar").is_null()) {
+    sendError(task.id, "Either \"json_schema\" or \"grammar\" can be specified, but not both", ERROR_TYPE_INVALID_REQUEST);
+    return false;
+  } else if (data.contains("json_schema") && !data.contains("grammar")) {
+    try {
+      auto schema                = json_value(data, "json_schema", json::object());
+      slot.sparams.grammar       = json_schema_to_grammar(schema);
+    } catch (const std::exception & e) {
+      sendError(task.id, std::string("\"json_schema\": ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+      return false;
+    }
+  } else {
+    slot.sparams.grammar       = json_value(data, "grammar",           default_sparams.grammar);
+  }
+
   if (slot.params.cache_prompt && slot.ga_n != 1) {
     slot.params.cache_prompt = false;
   }
@@ -936,9 +1026,44 @@ bool InferenceContext::launchSlotWithTask(server_slot & slot, const server_task 
     } else {
       slot.prompt = *prompt;
     }
-    if (slot.prompt.is_array() && slot.prompt.size() == 0) {
+    if (slot.prompt.is_array() && slot.prompt.empty()) {
       sendError(task.id, "\"prompt\" cannot be an empty array", ERROR_TYPE_INVALID_REQUEST);
       return false;
+    }
+  }
+
+  // penalize user-provided tokens
+  {
+    slot.sparams.penalty_prompt_tokens.clear();
+    slot.sparams.use_penalty_prompt_tokens = false;
+
+    const auto & penalty_prompt = data.find("penalty_prompt");
+
+    if (penalty_prompt != data.end()) {
+      if (penalty_prompt->is_string()) {
+        const auto penalty_prompt_string = penalty_prompt->get<std::string>();
+        slot.sparams.penalty_prompt_tokens = llama_tokenize(model, penalty_prompt_string, false);
+
+        if (slot.params.n_predict > 0) {
+          slot.sparams.penalty_prompt_tokens.reserve(slot.sparams.penalty_prompt_tokens.size() + slot.params.n_predict);
+        }
+        slot.sparams.use_penalty_prompt_tokens = true;
+      }
+      else if (penalty_prompt->is_array()) {
+        const auto n_tokens = penalty_prompt->size();
+        slot.sparams.penalty_prompt_tokens.reserve(n_tokens + std::max(0, slot.params.n_predict));
+
+        const int n_vocab = llama_n_vocab(model);
+        for (const auto & penalty_token : *penalty_prompt) {
+          if (penalty_token.is_number_integer()) {
+            const auto tok = penalty_token.get<llama_token>();
+            if (tok >= 0 && tok < n_vocab) {
+              slot.sparams.penalty_prompt_tokens.push_back(tok);
+            }
+          }
+        }
+        slot.sparams.use_penalty_prompt_tokens = true;
+      }
     }
   }
 
@@ -946,12 +1071,12 @@ bool InferenceContext::launchSlotWithTask(server_slot & slot, const server_task 
     slot.sparams.logit_bias.clear();
 
     if (json_value(data, "ignore_eos", false)) {
-      slot.sparams.logit_bias[llama_token_eos(model_)] = -INFINITY;
+      slot.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
     }
 
     const auto & logit_bias = data.find("logit_bias");
     if (logit_bias != data.end() && logit_bias->is_array()) {
-      const int n_vocab = llama_n_vocab(model_);
+      const int n_vocab = llama_n_vocab(model);
       for (const auto & el : *logit_bias) {
         // TODO: we may want to throw errors here, in case "el" is incorrect
         if (el.is_array() && el.size() == 2) {
@@ -970,7 +1095,7 @@ bool InferenceContext::launchSlotWithTask(server_slot & slot, const server_task 
               slot.sparams.logit_bias[tok] = bias;
             }
           } else if (el[0].is_string()) {
-            auto toks = llama_tokenize(model_, el[0].get<std::string>(), false);
+            auto toks = llama_tokenize(model, el[0].get<std::string>(), false);
             for (auto tok : toks) {
               slot.sparams.logit_bias[tok] = bias;
             }
@@ -1030,12 +1155,16 @@ void InferenceContext::processSingleTask(const server_task & task) {
   switch (task.type) {
     case SERVER_TASK_TYPE_COMPLETION:
     {
-      int64_t t_last = ggml_time_us();
-
       server_slot * slot = nullptr;
+      int id_slot = json_value(task.data, "id_slot", -1);
 
-      for (server_slot & use_slot : slots_) {
+      int64_t t_last = ggml_time_us();
+      for (server_slot & use_slot : slots) {
         // among all available slots, find the one that has been least recently used
+        if (use_slot.id == id_slot && use_slot.available()) {
+          slot = &use_slot;
+          break;
+        }
         if (use_slot.available() && use_slot.t_last_used < t_last) {
           slot = &use_slot;
           t_last = use_slot.t_last_used;
@@ -1044,9 +1173,9 @@ void InferenceContext::processSingleTask(const server_task & task) {
 
       if (slot == nullptr) {
           // if no slot is available, we defer this task for processing later
-        // inference_thread_.addTask([this, task](){
-        //   this->processSingleTask(task);
-        // });
+        inference_thread_.addTask([this, task](){
+          this->processSingleTask(task);
+        });
         return;
       }
 
@@ -1063,9 +1192,9 @@ void InferenceContext::processSingleTask(const server_task & task) {
     case SERVER_TASK_TYPE_CANCEL:
     {
       // release slot linked with the task id
-      for (auto & slot : slots_) {
-        if (slot.id_task == task.id_target) {
-          slot.release();
+      for (auto & use_slot : slots) {
+        if (use_slot.id_task == task.id_target) {
+          use_slot.release();
           break;
         }
       }
@@ -1086,7 +1215,6 @@ void InferenceContext::modelInference(LookupBodyCallback&& cb, std::shared_ptr<I
   task.id = task_meta_data->id;
   task.id_target = task_meta_data->id_target;
   task.infill = task_meta_data->infill;
-  task.embedding = task_meta_data->embedding;
   try {
     task.data = json::parse(task_meta_data->data);
   } catch (const std::exception &) {
@@ -1098,11 +1226,13 @@ void InferenceContext::modelInference(LookupBodyCallback&& cb, std::shared_ptr<I
     case InferencetasktypeTypeCompletion:
     {
       is_openai_ = true;
-      task.data = oaicompat_completion_params_parse(model_, task.data, chat_template_);
+      task.data = oaicompat_completion_params_parse(model, task.data, chat_template_);
       task.type = SERVER_TASK_TYPE_COMPLETION;
+      task.embedding = false;
     } break;
     case InferencetasktypeTypeEmbeedings:
     {
+      task.embedding = true;
       is_openai_ = false;
       // an input prompt can be a string or a list of tokens (integer)
       json prompt;
@@ -1148,7 +1278,7 @@ void InferenceContext::sendPartialResponse(completion_token_output& tkn, server_
   };
 
   if (slot.sparams.n_probs > 0) {
-    const std::vector<llama_token> to_send_toks = llama_tokenize(ctx_, tkn.text_to_send, false);
+    const std::vector<llama_token> to_send_toks = llama_tokenize(ctx, tkn.text_to_send, false);
     const size_t probs_pos      = std::min(slot.n_sent_token_probs,                       slot.generated_token_probs.size());
     const size_t probs_stop_pos = std::min(slot.n_sent_token_probs + to_send_toks.size(), slot.generated_token_probs.size());
 
@@ -1160,7 +1290,7 @@ void InferenceContext::sendPartialResponse(completion_token_output& tkn, server_
     }
     slot.n_sent_token_probs = probs_stop_pos;
 
-    res["completion_probabilities"] = probs_vector_to_json(ctx_, probs_output);
+    res["completion_probabilities"] = probs_vector_to_json(ctx, probs_output);
   }
 
   if (slot.oaicompat) {
@@ -1170,15 +1300,15 @@ void InferenceContext::sendPartialResponse(completion_token_output& tkn, server_
 
   if (is_openai_) {
     std::vector<json> result_array = format_partial_response_oaicompat(res, completion_id_);
-    for (auto & it : result_array) {
-      if (!it.empty()) {
+    for (auto it = result_array.begin(); it != result_array.end(); ++it) {
+      if (!it->empty()) {
         const std::string str =
             "data: " +
-            it.dump(-1, ' ', false, json::error_handler_t::replace) +
+            it->dump(-1, ' ', false, json::error_handler_t::replace) +
             "\n\n";
         if (callback_body_.find(slot.id_task) != callback_body_.end()) {
           LookupBodyCallback& cb = callback_body_[slot.id_task];
-          cb(ModelInferenceResult{true, false, str,NO_ERROR});
+          cb(ModelInferenceResult{true, false, str, NO_ERROR});
         }
       }
     }
@@ -1198,22 +1328,27 @@ void InferenceContext::sendFinalResponse(server_slot & slot) {
   json res;
   res = json {
     {"content",             !slot.params.stream ? slot.generated_text : ""},
+    {"id_slot",             slot.id},
     {"stop",                true},
-    {"model",               params.model_alias},
+    {"model",               model_name_},
     {"tokens_predicted",    slot.n_decoded},
     {"tokens_evaluated",    slot.n_prompt_tokens},
+    // {"generation_settings", get_formated_generation(slot)},
     {"prompt",              slot.prompt},
     {"truncated",           slot.truncated},
     {"stopped_eos",         slot.stopped_eos},
     {"stopped_word",        slot.stopped_word},
     {"stopped_limit",       slot.stopped_limit},
     {"stopping_word",       slot.stopping_word},
+    {"tokens_cached",       slot.n_past},
+    {"timings",             slot.get_formated_timings()}
   };
+
 
   if (slot.sparams.n_probs > 0) {
     std::vector<completion_token_output> probs;
     if (!slot.params.stream && slot.stopped_word) {
-      const std::vector<llama_token> stop_word_toks = llama_tokenize(ctx_, slot.stopping_word, false);
+      const std::vector<llama_token> stop_word_toks = llama_tokenize(ctx, slot.stopping_word, false);
 
       size_t safe_offset = std::min(slot.generated_token_probs.size(), stop_word_toks.size());
       probs = std::vector<completion_token_output>(
@@ -1225,7 +1360,7 @@ void InferenceContext::sendFinalResponse(server_slot & slot) {
             slot.generated_token_probs.end());
     }
 
-    res["completion_probabilities"] = probs_vector_to_json(ctx_, probs);
+    res["completion_probabilities"] = probs_vector_to_json(ctx, probs);
   }
 
   if (slot.oaicompat) {
@@ -1245,7 +1380,7 @@ void InferenceContext::sendFinalResponse(server_slot & slot) {
 
 void InferenceContext::sendEmbedding(server_slot & slot, const llama_batch & batch) {
   json res;
-  const int n_embd = llama_n_embd(model_);
+  const int n_embd = llama_n_embd(model);
 
   std::vector<float> embd_res(n_embd, 0.0f);
 
@@ -1254,9 +1389,9 @@ void InferenceContext::sendEmbedding(server_slot & slot, const llama_batch & bat
       continue;
     }
 
-    const float * embd = llama_get_embeddings_seq(ctx_, batch.seq_id[i][0]);
+    const float * embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
     if (embd == nullptr) {
-      embd = llama_get_embeddings_ith(ctx_, i);
+      embd = llama_get_embeddings_ith(ctx, i);
     }
 
     if (embd == nullptr) {

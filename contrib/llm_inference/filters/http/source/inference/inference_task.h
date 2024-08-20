@@ -1,15 +1,29 @@
 #pragma once
 
-#include "contrib/llm_inference/filters/http/source/inference/inference_thread.h"
-#include "contrib/llm_inference/filters/http/source/inference/inference_context.h"
-#include "source/extensions/filters/http/common/factory_base.h"
-
+#include <string>
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace LLMInference {
 
-// class InferenceContext;
+struct ModelParameter {
+  int n_threads;
+  int n_parallel;
+  bool embedding;
+};
+
+// https://community.openai.com/t/openai-chat-list-of-error-codes-and-types/357791/11
+enum error_type {
+    ERROR_TYPE_INVALID_REQUEST,
+    ERROR_TYPE_AUTHENTICATION,
+    ERROR_TYPE_SERVER,
+    ERROR_TYPE_NOT_FOUND,
+    ERROR_TYPE_PERMISSION,
+    ERROR_TYPE_UNAVAILABLE, // custom error
+    ERROR_TYPE_NOT_SUPPORTED, // custom error
+    NO_ERROR,
+};
+
 enum InferenceTaskType {
   InferencetasktypeTypeCompletion,
   InferencetasktypeTypeEmbeedings,
@@ -17,7 +31,7 @@ enum InferenceTaskType {
 };
 
 struct InferenceTaskMetaData {
-  InferenceTaskMetaData(const std::string&,bool,bool,int, InferenceTaskType,int);
+  InferenceTaskMetaData(const std::string&,bool,int, InferenceTaskType,int);
   std::string data;
   InferenceTaskType type;
   bool infill    = false;

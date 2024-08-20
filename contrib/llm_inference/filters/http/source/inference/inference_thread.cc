@@ -29,11 +29,14 @@ void InferenceThread::addTask(std::function<void(void)> callback) {
   signal();
 }
 
-// void InferenceThread::removeTask(std::shared_ptr<InferenceTaskMetaData>& task) {
-//   absl::MutexLock lock(&cache_mu_);
-  
-//   tasks_.erase(task);
-// }
+int InferenceThread::getId() {
+  {
+    absl::MutexLock lock(&id_mu_);
+    id_++;
+    return id_;
+  }
+}
+
 
 void InferenceThread::signal() {
   absl::MutexLock lock(&mu_);

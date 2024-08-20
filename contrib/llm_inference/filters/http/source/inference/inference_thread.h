@@ -37,7 +37,7 @@ public:
    * Removes the given cache from the caches that may be evicted from.
    * @param cache an unowned reference to the cache in question.
    */
-  // void removeTask(std::shared_ptr<InferenceTaskMetaData>& task);
+  int getId();
 
   /**
    * Signals the cache eviction thread that it's time to check the current cache
@@ -102,6 +102,9 @@ private:
   Thread::ThreadPtr thread_;
 
   std::function<void(void)>                callback_context_function_;
+  
+  int id_ ABSL_GUARDED_BY(id_mu_) = false;
+  absl::Mutex id_mu_;
 
 };
 

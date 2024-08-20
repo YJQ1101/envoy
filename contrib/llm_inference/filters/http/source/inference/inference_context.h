@@ -1,10 +1,12 @@
 #pragma once
 
+#include "contrib/llm_inference/filters/http/source/inference/inference_thread.h"
+#include "contrib/llm_inference/filters/http/source/inference/inference_task.h"
+#include "source/extensions/filters/http/common/factory_base.h"
+
 #include <functional>
 #include <memory>
 #include <vector>
-#include "inference_thread.h"
-#include "source/extensions/filters/http/common/factory_base.h"
 #include "llama.h"
 
 namespace Envoy {
@@ -13,20 +15,30 @@ namespace HttpFilters {
 namespace LLMInference {
 
 struct server_task;
-struct InferenceTaskMetaData;
 struct server_slot;
 struct completion_token_output;
 
-// https://community.openai.com/t/openai-chat-list-of-error-codes-and-types/357791/11
-enum error_type {
-    ERROR_TYPE_INVALID_REQUEST,
-    ERROR_TYPE_AUTHENTICATION,
-    ERROR_TYPE_SERVER,
-    ERROR_TYPE_NOT_FOUND,
-    ERROR_TYPE_PERMISSION,
-    ERROR_TYPE_UNAVAILABLE, // custom error
-    ERROR_TYPE_NOT_SUPPORTED, // custom error
-    NO_ERROR,
+struct server_metrics {
+    int64_t t_start = 0;
+
+    uint64_t n_prompt_tokens_processed_total = 0;
+    uint64_t t_prompt_processing_total       = 0;
+    uint64_t n_tokens_predicted_total        = 0;
+    uint64_t t_tokens_generation_total       = 0;
+
+    uint64_t n_prompt_tokens_processed = 0;
+    uint64_t t_prompt_processing       = 0;
+
+    uint64_t n_tokens_predicted  = 0;
+    uint64_t t_tokens_generation = 0;
+
+    void init() {
+        t_start = ggml_time_us();
+    }
+
+    void on_prompt_eval(const server_slot & slot);
+    void on_prediction(const server_slot & slot);
+    void reset_bucket();
 };
 
 struct ModelInferenceResult {
@@ -42,10 +54,30 @@ using LookupBodyCallback = std::function<void(ModelInferenceResult&&)>;
 class InferenceContext {
 public:
 
-  InferenceContext(Envoy::Singleton::InstanceSharedPtr, InferenceThread&, const int&, const std::string&, const std::string&);
+  InferenceContext(Envoy::Singleton::InstanceSharedPtr, InferenceThread&, const ModelParameter&, const std::string&, const std::string&);
   ~InferenceContext();
-  bool loadModel(const int& n_thread, const std::string& model_name);
+  bool loadModel(const ModelParameter& model_parameter, const std::string& model_name);
   void modelInference(LookupBodyCallback&& cb, std::shared_ptr<InferenceTaskMetaData>&&);
+  int getId();
+
+  llama_model * model = nullptr;
+  llama_context * ctx = nullptr;
+  llama_batch batch;
+  bool clean_kv_cache = true;
+  bool add_bos_token  = true;
+  int32_t n_ctx; // total context for all clients / slots
+  // system prompt
+  bool system_need_update_ = false;
+  std::string              system_prompt;
+  std::vector<llama_token> system_tokens;
+
+  // slots / clients
+  std::vector<server_slot> slots;
+  server_metrics metrics;
+  std::string chat_template_ = "";
+  std::string completion_id_;
+  bool is_openai_;
+
 
 private:
 
@@ -63,29 +95,10 @@ private:
   // A shared_ptr to keep the cache singleton alive as long as any of its caches are in use.
   const Envoy::Singleton::InstanceSharedPtr owner_;
   InferenceThread& inference_thread_;
-  std::string model_name_;
-  // InferenceTask& task_;
-  // InferenceTaskMetaData& task_meta_data_;
-  // LookupHeadersCallback callback_headers_;
   absl::flat_hash_map<int, LookupBodyCallback> callback_body_;
-  // File actions may be initiated in the file thread or the filter thread, and cancelled or
-  // completed from either, therefore must be guarded by a mutex.
-  // absl::Mutex mu_;
-
-  llama_model * model_ = nullptr;
-  llama_context * ctx_ = nullptr;
-  llama_batch batch_;
-  bool clean_kv_cache_ = true;
-  bool add_bos_token_  = true;
-  int32_t n_ctx_; // total context for all clients / slots
-  
-  std::vector<server_slot> slots_;
-  std::string chat_template_ = "";
-  std::string completion_id_;
-  bool is_openai_;
+  std::string model_name_;
 };
 
-using InferenceContextPtr = std::unique_ptr<InferenceContext>;
 using InferenceContextSharedPtr = std::shared_ptr<InferenceContext>;
 
 } // namespace LLMInference

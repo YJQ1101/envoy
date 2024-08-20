@@ -4,6 +4,7 @@
 
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 #include "contrib/envoy/extensions/filters/http/llm_inference/v3/llm_inference.pb.h"
+#include "contrib/llm_inference/filters/http/source/inference/inference_context.h"
 #include "contrib/llm_inference/filters/http/source/inference/inference_task.h"
 
 namespace Envoy {
@@ -17,26 +18,17 @@ class LLMInferenceFilterConfig : public Router::RouteSpecificFilterConfig  {
 public:
   LLMInferenceFilterConfig(const envoy::extensions::filters::http::llm_inference::v3::modelParameter& proto_config);
 
-  const int& n_thread() const {return n_thread_;}
+  const ModelParameter& modelParameter() const {return modelParameter_;}
   const ModelPath& modelPath() const {return modelPath_; }
-  const int& get_id() {
-    {
-      // absl::MutexLock lock(&mu_);
-      return ++id_task_;
-    }
-  }
 
 private:
-  const int n_thread_;
+  const ModelParameter modelParameter_;
   const ModelPath modelPath_;
-  int id_task_ = 0;
-  // ABSL_GUARDED_BY(mu_) = false;
-  // absl::Mutex mu_;
 };
 
 using LLMInferenceFilterConfigSharedPtr = std::shared_ptr<LLMInferenceFilterConfig>;
 
-using ModelChosen = Protobuf::RepeatedPtrField<std::string>;
+using ModelChosen = std::string;
 
 class LLMInferenceFilterConfigPerRoute : public Router::RouteSpecificFilterConfig  {
 public:
@@ -75,13 +67,12 @@ private:
   const LLMInferenceFilterConfigSharedPtr config_;
   const InferenceContextSharedPtr ctx_;
 
-  // InferenceTaskType task_type_ = INFERENCETASKTYPE_DEFAULT;
-
   Http::StreamDecoderFilterCallbacks* decoder_callbacks_;
-  int id_task_;
-  int n_thread() const;
+  InferenceTaskType task_type_;
+  int id_task_ = -1;
+  bool header_ = false;
+  const ModelParameter modelParameter() const;
   const ModelPath modelPath() const;
-  int get_id() const;
 };
 
 using LLMInferenceFilterSharedPtr = std::shared_ptr<LLMInferenceFilter>;

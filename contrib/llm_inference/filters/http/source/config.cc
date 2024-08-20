@@ -13,7 +13,7 @@ public:
   InferenceSingleton(Thread::ThreadFactory& thread_factory)
       : inference_thread_(thread_factory) {}
 
-  std::shared_ptr<InferenceContext> load(std::shared_ptr<InferenceSingleton> singleton, const int& n_thread,
+  std::shared_ptr<InferenceContext> load(std::shared_ptr<InferenceSingleton> singleton, const ModelParameter& model_parameter,
               const std::string& model_name , const std::string& model_path) {
     std::shared_ptr<InferenceContext> ctx;
     absl::MutexLock lock(&mu_);
@@ -22,7 +22,7 @@ public:
       ctx = it->second.lock();
     }
     if (!ctx) {
-      ctx = std::make_shared<InferenceContext>(singleton, inference_thread_, n_thread, model_path, model_name);
+      ctx = std::make_shared<InferenceContext>(singleton, inference_thread_, model_parameter, model_path, model_name);
       ctx_[model_name] = ctx;
     }
     return ctx;
@@ -55,17 +55,11 @@ Http::FilterFactoryCb LLMInferenceFilterConfigFactory::createFilterFactoryFromPr
               return std::make_shared<InferenceSingleton>(context.api().threadFactory());
             });
 
-    InferenceContextSharedPtr ctx; //inference->load(inference, config->n_thread(), "qwen2", "/home/yuanjq/model/qwen2-7b-instruct-q5_k_m.gguf");
+    InferenceContextSharedPtr ctx;
     auto modelpath = config->modelPath();
-    for (const std::string& str: model_name_) {
-      std::cout << str << std::endl;
-
-      if (modelpath.contains(str)) {
-        // std::cout << modelpath[str] << std::endl;
-
-        ctx = inference->load(inference, config->n_thread(), str, modelpath[str]);
+      if (modelpath.contains(model_name_)) {
+        ctx = inference->load(inference, config->modelParameter(), model_name_, modelpath[model_name_]);
       }
-    }
 
     return [config, ctx](Http::FilterChainFactoryCallbacks& callbacks) -> void {
       callbacks.addStreamDecoderFilter(std::make_shared<LLMInferenceFilter>(config, ctx));
@@ -78,10 +72,11 @@ Router::RouteSpecificFilterConfigConstSharedPtr LLMInferenceFilterConfigFactory:
     Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {
     LLMInferenceFilterConfigPerRouteSharedPtr config = 
         std::make_shared<LLMInferenceFilterConfigPerRoute>(LLMInferenceFilterConfigPerRoute(proto_config));
-
-    for (const auto& str : config->modelChosen()) {
-        model_name_.push_back(str);
-    }
+    
+    model_name_ = config->modelChosen();
+    // for (const auto& str : config->modelChosen()) {
+    //   model_name_.insert(str);
+    // }
     return config;
 }
 

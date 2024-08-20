@@ -31,7 +31,7 @@ private:
       const envoy::extensions::filters::http::llm_inference::v3::modelChosen& proto_config,
       Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) override;
   
-  std::vector<std::string> model_name_;
+  std::string model_name_;
 };
 
 } // namespace LLMInference

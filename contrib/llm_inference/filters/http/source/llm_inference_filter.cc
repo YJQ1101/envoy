@@ -18,7 +18,8 @@ namespace LLMInference {
 
 LLMInferenceFilterConfig::LLMInferenceFilterConfig(
     const envoy::extensions::filters::http::llm_inference::v3::modelParameter& proto_config)
-    : n_thread_(proto_config.n_thread()), modelPath_(proto_config.modelpath()) {}
+    : modelParameter_{proto_config.n_threads(), proto_config.n_parallel(), proto_config.embedding()},
+      modelPath_(proto_config.modelpath()) {}
 
 LLMInferenceFilterConfigPerRoute::LLMInferenceFilterConfigPerRoute(
     const envoy::extensions::filters::http::llm_inference::v3::modelChosen& proto_config)
@@ -30,23 +31,21 @@ LLMInferenceFilter::LLMInferenceFilter(LLMInferenceFilterConfigSharedPtr config,
 LLMInferenceFilter::~LLMInferenceFilter() {}
 
 void LLMInferenceFilter::onDestroy() {
-  ctx_->modelInference([](ModelInferenceResult&&) {
-  }, std::make_shared<InferenceTaskMetaData>("{}", false, false, get_id(), InferencetasktypeTypeCancel, id_task_));
+  if (id_task_ != -1) {
+    ctx_->modelInference([](ModelInferenceResult&&) {
+    }, std::make_shared<InferenceTaskMetaData>("{}", false, ctx_->getId(), InferencetasktypeTypeCancel, id_task_));
+  }
 }
 
-int LLMInferenceFilter::n_thread() const {
-  return config_->n_thread();
+const ModelParameter LLMInferenceFilter::modelParameter() const {
+  return config_->modelParameter();
 }
 
 const ModelPath LLMInferenceFilter::modelPath() const {
   return config_->modelPath();
 }
 
-int LLMInferenceFilter::get_id() const {
-  return config_->get_id();
-}
-
-Http::FilterHeadersStatus LLMInferenceFilter::decodeHeaders(Http::RequestHeaderMap&, bool end_stream) {
+Http::FilterHeadersStatus LLMInferenceFilter::decodeHeaders(Http::RequestHeaderMap& headers, bool end_stream) {
   if (end_stream) {
     // If this is a header-only request, we don't need to do any inference.
     return Http::FilterHeadersStatus::Continue;
@@ -59,24 +58,27 @@ Http::FilterHeadersStatus LLMInferenceFilter::decodeHeaders(Http::RequestHeaderM
   if (!per_route_inference_settings) {
     return Http::FilterHeadersStatus::Continue;
   }
+  
+  const absl::string_view headersPath = headers.getPathValue();
+  if (headersPath == "/v1/chat/completions") {
+    task_type_ = InferencetasktypeTypeCompletion;
+  } else if (headersPath == "/v1/embeddings") {
+    task_type_ = InferencetasktypeTypeEmbeedings;
+  } 
   return Http::FilterHeadersStatus::StopIteration;
 }
 
 Http::FilterDataStatus LLMInferenceFilter::decodeData(Buffer::Instance& data, bool end_stream) {
   if (!end_stream) {
-    id_task_ = get_id();
-    getHeaders(std::make_shared<InferenceTaskMetaData>(data.toString(), false, false, id_task_, InferencetasktypeTypeCompletion, -1));
+    id_task_ = ctx_->getId();
+    getHeaders(std::make_shared<InferenceTaskMetaData>(data.toString(), false, id_task_, task_type_, -1));
   }
-  return Http::FilterDataStatus::StopIterationAndWatermark;
+  return Http::FilterDataStatus::StopIterationNoBuffer;
 }
 
 void LLMInferenceFilter::getHeaders(std::shared_ptr<InferenceTaskMetaData>&& task_meta_data) {
-
-  std::cout << "hhhh" << task_meta_data->id << std::endl;
   LLMInferenceFilterWeakPtr self = weak_from_this();
 
-  Http::ResponseHeaderMapPtr headers{Http::createHeaderMap<Http::ResponseHeaderMapImpl>({{Http::Headers::get().Status, "200"}})};
-  decoder_callbacks_->encodeHeaders(std::move(headers), false, "good");
   ctx_->modelInference([self, &dispatcher = decoder_callbacks_->dispatcher()](ModelInferenceResult&& body) {
     dispatcher.post(
       [self, body = std::move(body)]() mutable {
@@ -116,6 +118,12 @@ void LLMInferenceFilter::onBody(ModelInferenceResult&& body) {
         break;
     }
   } else {
+    if (!header_) {
+      Http::ResponseHeaderMapPtr headers{Http::createHeaderMap<Http::ResponseHeaderMapImpl>({{Http::Headers::get().Status, "200"}})};
+      decoder_callbacks_->encodeHeaders(std::move(headers), false, "good");
+      header_ = true;
+    }
+
     Buffer::InstancePtr request_data = std::make_unique<Buffer::OwnedImpl>(body.ss);
 
     if (body.stopped) {
@@ -125,15 +133,8 @@ void LLMInferenceFilter::onBody(ModelInferenceResult&& body) {
     }
   }
 }
-//   //多平台
-//   //卸载模型，查看内存情况
-//   //测多次，查看内存情况
-//   //资源复用
-
-
+//   //测多次，查看内存情况 
 //   //推理时间超出预期，首字节时间，整体时间
-//   //请求中止，推理中止
-// }
 
 } // namespace LLMInference
 } // namespace HttpFilters
