@@ -7,9 +7,15 @@ namespace HttpFilters {
 namespace LLMInference {
 
 struct ModelParameter {
-  int n_threads;
-  int n_parallel;
-  bool embedding;
+  int n_threads = 32;
+  int n_parallel = 1;
+};
+
+struct ModelChosen {
+  std::string model_name;
+  int first_byte_timeout = 10;
+  int inference_timeout = 90;
+  bool embedding = false;
 };
 
 // https://community.openai.com/t/openai-chat-list-of-error-codes-and-types/357791/11

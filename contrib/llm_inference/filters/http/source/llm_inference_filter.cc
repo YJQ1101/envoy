@@ -9,6 +9,8 @@
 #include "source/common/protobuf/utility.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/header_map_impl.h"
+#include <chrono>
+#include <ctime>
 #include <memory>
 
 namespace Envoy {
@@ -18,12 +20,12 @@ namespace LLMInference {
 
 LLMInferenceFilterConfig::LLMInferenceFilterConfig(
     const envoy::extensions::filters::http::llm_inference::v3::modelParameter& proto_config)
-    : modelParameter_{proto_config.n_threads(), proto_config.n_parallel(), proto_config.embedding()},
+    : modelParameter_{proto_config.n_threads(), proto_config.n_parallel()},
       modelPath_(proto_config.modelpath()) {}
 
 LLMInferenceFilterConfigPerRoute::LLMInferenceFilterConfigPerRoute(
     const envoy::extensions::filters::http::llm_inference::v3::modelChosen& proto_config)
-    : modelChosen_(proto_config.usemodel()) {}
+    : modelChosen_{proto_config.usemodel() ,proto_config.first_byte_timeout(), proto_config.inference_timeout(), proto_config.embedding()} {}
 
 LLMInferenceFilter::LLMInferenceFilter(LLMInferenceFilterConfigSharedPtr config, InferenceContextSharedPtr ctx)
     : config_(config), ctx_(ctx) {}
@@ -33,7 +35,7 @@ LLMInferenceFilter::~LLMInferenceFilter() {}
 void LLMInferenceFilter::onDestroy() {
   if (id_task_ != -1) {
     ctx_->modelInference([](ModelInferenceResult&&) {
-    }, std::make_shared<InferenceTaskMetaData>("{}", false, ctx_->getId(), InferencetasktypeTypeCancel, id_task_));
+    }, std::make_shared<InferenceTaskMetaData>("{}", false, ctx_->getId(), InferencetasktypeTypeCancel, id_task_), inference_timeout_);
   }
 }
 
@@ -51,20 +53,28 @@ Http::FilterHeadersStatus LLMInferenceFilter::decodeHeaders(Http::RequestHeaderM
     return Http::FilterHeadersStatus::Continue;
   }
 
-  // // Route-level configuration overrides filter-level configuration.
+  // Route-level configuration.
   const auto* per_route_inference_settings =
       Http::Utility::resolveMostSpecificPerFilterConfig<LLMInferenceFilterConfigPerRoute>(
           "envoy.filters.http.llm_inference", decoder_callbacks_->route());
   if (!per_route_inference_settings) {
     return Http::FilterHeadersStatus::Continue;
+  } else {
+    auto per_route_config = per_route_inference_settings->modelChosen();
+    first_byte_timeout_ = per_route_config.first_byte_timeout;
+    inference_timeout_ = per_route_config.inference_timeout;
   }
   
+  // check header
   const absl::string_view headersPath = headers.getPathValue();
   if (headersPath == "/v1/chat/completions") {
     task_type_ = InferencetasktypeTypeCompletion;
   } else if (headersPath == "/v1/embeddings") {
     task_type_ = InferencetasktypeTypeEmbeedings;
-  } 
+  } else {
+    return Http::FilterHeadersStatus::Continue;
+  }
+
   return Http::FilterHeadersStatus::StopIteration;
 }
 
@@ -77,9 +87,17 @@ Http::FilterDataStatus LLMInferenceFilter::decodeData(Buffer::Instance& data, bo
 }
 
 void LLMInferenceFilter::getHeaders(std::shared_ptr<InferenceTaskMetaData>&& task_meta_data) {
-  LLMInferenceFilterWeakPtr self = weak_from_this();
+  // set first byte timeout
+  timer_ = decoder_callbacks_->dispatcher().createTimer([this]() -> void {
+    decoder_callbacks_->continueDecoding();
+  });
+  timer_->enableTimer(std::chrono::seconds(first_byte_timeout_));
 
+  LLMInferenceFilterWeakPtr self = weak_from_this();
+  // The dispatcher needs to be captured because there's no guarantee that
+  // decoder_callbacks_->dispatcher() is thread-safe.
   ctx_->modelInference([self, &dispatcher = decoder_callbacks_->dispatcher()](ModelInferenceResult&& body) {
+    // The callback is posted to the dispatcher to make sure it is called on the worker thread.
     dispatcher.post(
       [self, body = std::move(body)]() mutable {
         if (LLMInferenceFilterSharedPtr llm_inference_filter = self.lock()) {
@@ -87,10 +105,11 @@ void LLMInferenceFilter::getHeaders(std::shared_ptr<InferenceTaskMetaData>&& tas
         }
       }
     );
-  }, std::move(task_meta_data));
+  }, std::move(task_meta_data), inference_timeout_);
 }
 
 void LLMInferenceFilter::onBody(ModelInferenceResult&& body) {
+  timer_->disableTimer();
   if (!body.inference_successed) {
     switch (body.type) {
       case ERROR_TYPE_INVALID_REQUEST:
@@ -124,17 +143,16 @@ void LLMInferenceFilter::onBody(ModelInferenceResult&& body) {
       header_ = true;
     }
 
-    Buffer::InstancePtr request_data = std::make_unique<Buffer::OwnedImpl>(body.ss);
+    request_data_ = std::make_unique<Buffer::OwnedImpl>(body.ss);
 
     if (body.stopped) {
-      decoder_callbacks_->encodeData(*request_data, true);
+      decoder_callbacks_->encodeData(*request_data_, true);
     } else {
-      decoder_callbacks_->encodeData(*request_data, false);
+      decoder_callbacks_->encodeData(*request_data_, false);
     }
   }
 }
 //   //测多次，查看内存情况 
-//   //推理时间超出预期，首字节时间，整体时间
 
 } // namespace LLMInference
 } // namespace HttpFilters

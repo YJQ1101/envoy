@@ -65,28 +65,7 @@ struct completion_token_output {
     std::vector<token_prob> probs;
 };
 
-#define LOG_ERROR(  MSG, ...) server_log("ERR",  __func__, __LINE__, MSG, __VA_ARGS__)
-#define LOG_WARNING(MSG, ...) server_log("WARN", __func__, __LINE__, MSG, __VA_ARGS__)
 #define LOG_INFO(   MSG, ...) server_log("INFO", __func__, __LINE__, MSG, __VA_ARGS__)
-
-static inline void server_log(const char * level, const char * function, int line, const char * message, const json & extra);
-
-template <typename T>
-static T json_value(const json & body, const std::string & key, const T & default_value) {
-    // Fallback null to default value
-    if (body.contains(key) && !body.at(key).is_null()) {
-        try {
-            return body.at(key);
-        } catch (NLOHMANN_JSON_NAMESPACE::detail::type_error const &) {
-            std::stringstream ss;
-            ss << "Wrong type supplied for parameter '" << key << "'. Expected '" << json(default_value).type_name() << "', using default value.";
-            LOG_WARNING(ss.str().c_str(), body);
-            return default_value;
-        }
-    } else {
-        return default_value;
-    }
-}
 
 static inline void server_log(const char * level, const char * function, int line, const char * message, const json & extra) {
     std::stringstream ss_tid;
@@ -128,6 +107,22 @@ static inline void server_log(const char * level, const char * function, int lin
         printf("%.*s\n", static_cast<int>(str.size()), str.data());
     }
     fflush(stdout);
+}
+
+template <typename T>
+static T json_value(const json & body, const std::string & key, const T & default_value) {
+    // Fallback null to default value
+    if (body.contains(key) && !body.at(key).is_null()) {
+        try {
+            return body.at(key);
+        } catch (NLOHMANN_JSON_NAMESPACE::detail::type_error const &) {
+            std::stringstream ss;
+            ss << "Wrong type supplied for parameter '" << key << "'. Expected '" << json(default_value).type_name() << "', using default value.";
+            return default_value;
+        }
+    } else {
+        return default_value;
+    }
 }
 
 // Format given chat. If tmpl is empty, we take the template from model metadata
@@ -189,6 +184,13 @@ static std::string gen_chatcmplid() {
 }
 
 static size_t common_part(const std::vector<llama_token> & a, const std::vector<llama_token> & b) {
+    size_t i;
+    for (i = 0; i < a.size() && i < b.size() && a[i] == b[i]; i++) {}
+
+    return i;
+}
+
+static size_t common_part(const std::string & a, const std::string & b) {
     size_t i;
     for (i = 0; i < a.size() && i < b.size() && a[i] == b[i]; i++) {}
 

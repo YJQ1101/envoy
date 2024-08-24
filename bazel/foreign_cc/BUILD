@@ -446,16 +446,18 @@ envoy_cmake(
     name = "llama",
     cache_entries = {
         "CMAKE_INSTALL_LIBDIR": "lib",
-        "LLAMA_STATIC": "on",
+        "BUILD_SHARED_LIBS": "off",
+        "GGML_OPENMP": "off",
     },
     lib_source = "@com_github_ggerganov_llama//:all",
     out_static_libs = select({
         "//conditions:default": [
             "libllama.a",
+            "libggml.a",
         ],
     }),
     tags = ["skip_on_windows"],
     postfix_script = select({
-        "//conditions:default": "rm -rf $INSTALLDIR/include/common && mkdir $INSTALLDIR/include/common && cp -L $EXT_BUILD_ROOT/external/com_github_ggerganov_llama/common/* $INSTALLDIR/include/common",
+        "//conditions:default": "rm -rf $INSTALLDIR/include/common && mkdir $INSTALLDIR/include/common && cp -rL $EXT_BUILD_ROOT/external/com_github_ggerganov_llama/common/* $INSTALLDIR/include/common",
     }),
 )

@@ -8,16 +8,17 @@
 #include <llama.h>
 #include <memory>
 
-char const *LLAMA_COMMIT = "123";
-char const *LLAMA_COMPILER = "123";
-char const *LLAMA_BUILD_TARGET = "123";
+char const *LLAMA_COMMIT = "";
+char const *LLAMA_COMPILER = "";
+char const *LLAMA_BUILD_TARGET = "";
 int LLAMA_BUILD_NUMBER = 1;
-gpt_params params;
 
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace LLMInference {
+
+gpt_params params;
 
 struct server_slot {
     int id;
@@ -242,39 +243,21 @@ struct server_task {
     bool embedding = false;
 };
 
-void server_metrics::on_prompt_eval(const server_slot & slot) {
-  n_prompt_tokens_processed_total += slot.n_prompt_tokens_processed;
-  n_prompt_tokens_processed       += slot.n_prompt_tokens_processed;
-  t_prompt_processing             += slot.t_prompt_processing;
-  t_prompt_processing_total       += slot.t_prompt_processing;
-}
-
-void server_metrics::on_prediction(const server_slot & slot) {
-  n_tokens_predicted_total   += slot.n_decoded;
-  n_tokens_predicted         += slot.n_decoded;
-  t_tokens_generation        += slot.t_token_generation;
-  t_tokens_generation_total  += slot.t_token_generation;
-}
-
-void server_metrics::reset_bucket() {
-  n_prompt_tokens_processed = 0;
-  t_prompt_processing       = 0;
-  n_tokens_predicted        = 0;
-  t_tokens_generation       = 0;
-}
+/* ================================================================= */
+/* Constructors */
+/* ================================================================= */
 
 InferenceContext::InferenceContext(Singleton::InstanceSharedPtr owner, InferenceThread& inference_thread, 
-          const ModelParameter& model_parameter, const std::string& model_path, const std::string& model_name):owner_(owner),
-           inference_thread_(inference_thread), model_name_(model_name) {
-  // inference_thread_.addTask([this, n_thread, model_path](){
-  //   this->loadModel(n_thread, model_path);
-  // });
-  loadModel(model_parameter, model_path);
+          const ModelParameter& model_parameter, const std::string& model_path, const ModelChosen& model_chosen):owner_(owner),
+           inference_thread_(inference_thread), model_name_(model_chosen.model_name) {
+  loadModel(model_parameter, model_path, model_chosen);
 }
 
-InferenceContext::~InferenceContext() {
-  std::cout << "InferenceContext free" << std::endl;
+/* ================================================================= */
+/* Destructors */
+/* ================================================================= */
 
+InferenceContext::~InferenceContext() {
   llama_kv_cache_clear(ctx);
   if (ctx) {
     llama_free(ctx);
@@ -296,16 +279,23 @@ InferenceContext::~InferenceContext() {
   llama_backend_free();
 }
 
+/* ================================================================= */
+/* get task id */
+/* ================================================================= */
+
 int InferenceContext::getId() {
   return inference_thread_.getId();
 }
 
-bool InferenceContext::loadModel(const ModelParameter& model_parameter, const std::string& model_path) {
-  // gpt_params params;
+/* ================================================================= */
+/* load model */
+/* ================================================================= */
+
+bool InferenceContext::loadModel(const ModelParameter& model_parameter, const std::string& model_path, const ModelChosen& model_chosen) {
   params.n_threads = model_parameter.n_threads;
   params.n_parallel = model_parameter.n_parallel;
-  params.embedding = model_parameter.embedding;
-
+  params.embedding = model_chosen.embedding;
+  
   params.model = model_path;
   
   gpt_params_handle_model_default(params);
@@ -320,14 +310,17 @@ bool InferenceContext::loadModel(const ModelParameter& model_parameter, const st
   {
     // dedicate one sequence to the system prompt
     params.n_parallel += 1;
-    std::tie(model, ctx) = llama_init_from_gpt_params(params);
+    llama_init_result llama_init = llama_init_from_gpt_params(params);
+    model = llama_init.model;
+    ctx = llama_init.context;
     params.n_parallel -= 1; // but be sneaky about it
     if (model == nullptr) {
       return false;
     }
     n_ctx = llama_n_ctx(ctx);
-    add_bos_token = llama_should_add_bos_token(model);
-    GGML_ASSERT(llama_add_eos_token(model) != 1);
+
+    add_bos_token = llama_add_bos_token(model);
+    has_eos_token = !llama_add_eos_token(model);
   }
   // init slot
   {
@@ -372,10 +365,8 @@ bool InferenceContext::loadModel(const ModelParameter& model_parameter, const st
         const int32_t n_batch = llama_n_batch(ctx);
 
         // only a single seq_id per token is needed
-        batch = llama_batch_init(n_batch, 0, 1);
+        batch = llama_batch_init(std::max(n_batch, params.n_parallel), 0, 1);
       }
-
-      metrics.init();
     }
   }
 
@@ -386,7 +377,6 @@ bool InferenceContext::loadModel(const ModelParameter& model_parameter, const st
     llama_chat_message chat[] = {{"user", "test"}};
 
     if (!(llama_chat_apply_template(model, nullptr, chat, 1, true, nullptr, 0) > 0)) {
-      LOG_ERROR("The chat template that comes with this model is not yet supported, falling back to chatml. This may cause the model to output suboptimal responses", {});
       chat_template_ = "chatml";
     }
   }
@@ -394,10 +384,382 @@ bool InferenceContext::loadModel(const ModelParameter& model_parameter, const st
 }
 
 /* ================================================================= */
-/*
-The top part mainly does the work of loading models and loading inference tasks, 
-and the bottom part mainly does the work of model inference
-*/
+/* Preparation for model inference,
+   After preparation, asynchronous thread will be called to handle inference tasks */
+/* ================================================================= */
+
+void InferenceContext::modelInference(LookupBodyCallback&& cb, std::shared_ptr<InferenceTaskMetaData>&& task_meta_data, int& inference_timeout) {
+  callback_body_[task_meta_data->id] = std::move(cb);
+  completion_id_ = gen_chatcmplid();
+  inference_timeout_ = inference_timeout * 1e6;
+  server_task task;
+  task.id = task_meta_data->id;
+  task.id_target = task_meta_data->id_target;
+  task.infill = task_meta_data->infill;
+  try {
+    task.data = json::parse(task_meta_data->data);
+  } catch (const std::exception &) {
+    sendError(task.id, "request data is wrong", ERROR_TYPE_INVALID_REQUEST);
+    return;
+  }
+
+  switch (task_meta_data->type) {
+    case InferencetasktypeTypeCompletion:
+    {
+      is_openai_ = true;
+      task.data = oaicompat_completion_params_parse(model, task.data, chat_template_);
+      task.type = SERVER_TASK_TYPE_COMPLETION;
+      task.embedding = false;
+    } break;
+    case InferencetasktypeTypeEmbeedings:
+    {
+      task.embedding = true;
+      is_openai_ = false;
+      // an input prompt can be a string or a list of tokens (integer)
+      json prompt;
+      if (task.data.count("input") != 0) {
+          is_openai_ = true;
+          prompt = task.data.at("input");
+      } else if (task.data.count("content") != 0) {
+          // with "content", we only support single prompt
+          prompt = std::vector<std::string>{task.data.at("content")};
+      } else {
+          sendError(task.id, "input or content must be provided", ERROR_TYPE_INVALID_REQUEST);
+          return;
+      }
+      task.data = json{{"prompt", prompt}};
+      task.type = SERVER_TASK_TYPE_COMPLETION;
+    } break;
+    case InferencetasktypeTypeCancel:
+    {
+      task.type = SERVER_TASK_TYPE_CANCEL;
+      break;
+    }
+  }
+
+  inference_thread_.addTask([this, task](){
+    this->processSingleTask(task);
+  });
+}
+
+/* ================================================================= */
+/* handle inference tasks,
+   and assign slot to the task */
+/* ================================================================= */
+
+void InferenceContext::processSingleTask(const server_task & task) {
+  switch (task.type) {
+    case SERVER_TASK_TYPE_COMPLETION:
+    {
+      server_slot * slot = nullptr;
+      std::string prompt;
+      if (task.data.contains("prompt") && task.data.at("prompt").is_string()) {
+          prompt = json_value(task.data, "prompt", std::string());
+      }
+
+      slot = getAvailableSlot(prompt);
+
+      if (slot == nullptr) {
+        // if no slot is available, we defer this task for processing later
+        inference_thread_.addTask([this, task](){
+          this->processSingleTask(task);
+        });
+        return;
+      }
+
+      if (!slot->available()) {
+        // if this slot isn't available, we defer this task for processing later
+        inference_thread_.addTask([this, task](){
+          this->processSingleTask(task);
+        });
+        return;
+      }
+
+      slot->reset();
+
+      slot->id_task   = task.id;
+      slot->infill    = task.infill;
+      slot->embedding = task.embedding;
+      if (!launchSlotWithTask(*slot, task)) {
+        return;
+      }
+    } break;
+    case SERVER_TASK_TYPE_CANCEL:
+    {
+      // release slot linked with the task id
+      for (auto & use_slot : slots) {
+        if (use_slot.id_task == task.id_target) {
+          use_slot.release();
+          break;
+        }
+      }
+    } break;
+    case SERVER_TASK_TYPE_NEXT_RESPONSE:
+    {
+      // do nothing
+    } break;
+  }
+  updateSlots();
+}
+
+server_slot * InferenceContext::getAvailableSlot(const std::string & prompt) {
+  server_slot * ret = nullptr;
+  // find the slot that has at least n% prompt similarity
+  if (ret == nullptr && slot_prompt_similarity != 0.0f && !prompt.empty()) {
+    int max_lcp_len = 0;
+    float similarity = 0;
+
+    for (server_slot & slot : slots) {
+      // skip the slot if it is not available
+      if (!slot.available()) {
+        continue;
+      }
+
+      // skip the slot if it does not contains prompt
+      if (!slot.prompt.is_string()) {
+          continue;
+      }
+
+      // current slot's prompt
+      std::string slot_prompt = slot.prompt.get<std::string>();
+
+      // length of the current slot's prompt
+      int slot_prompt_len = slot_prompt.size();
+
+      // length of the Longest Common Prefix between the current slot's prompt and the input prompt
+      int lcp_len = common_part(slot_prompt, prompt);
+
+      // fraction of the common substring length compared to the current slot's prompt length
+      similarity = static_cast<float>(lcp_len) / slot_prompt_len;
+
+      // select the current slot if the criteria match
+      if (lcp_len > max_lcp_len && similarity > slot_prompt_similarity) {
+        max_lcp_len = lcp_len;
+        ret = &slot;
+      }
+    }
+  }
+
+  // find the slot that has been least recently used
+  if (ret == nullptr) {
+    int64_t t_last = ggml_time_us();
+    for (server_slot & slot : slots) {
+      // skip the slot if it is not available
+      if (!slot.available()) {
+        continue;
+      }
+
+      // select the current slot if the criteria match
+      if (slot.t_last_used < t_last) {
+        t_last = slot.t_last_used;
+        ret = &slot;
+      }
+    }
+  }
+  return ret;
+}
+
+bool InferenceContext::launchSlotWithTask(server_slot & slot, const server_task & task) {
+  slot_params default_params;
+  llama_sampling_params default_sparams;
+  auto & data = task.data;
+
+  if (data.count("__oaicompat") != 0) {
+    slot.oaicompat = true;
+    slot.oaicompat_model = json_value(data, "model", std::string(DEFAULT_OAICOMPAT_MODEL));
+  } else {
+    slot.oaicompat = false;
+    slot.oaicompat_model = "";
+  }
+  slot.params.stream             = json_value(data, "stream",            false);
+  slot.params.cache_prompt       = json_value(data, "cache_prompt",      false);
+  slot.params.n_predict          = json_value(data, "n_predict",         default_params.n_predict);
+  slot.sparams.top_k             = json_value(data, "top_k",             default_sparams.top_k);
+  slot.sparams.top_p             = json_value(data, "top_p",             default_sparams.top_p);
+  slot.sparams.min_p             = json_value(data, "min_p",             default_sparams.min_p);
+  slot.sparams.tfs_z             = json_value(data, "tfs_z",             default_sparams.tfs_z);
+  slot.sparams.typical_p         = json_value(data, "typical_p",         default_sparams.typical_p);
+  slot.sparams.temp              = json_value(data, "temperature",       default_sparams.temp);
+  slot.sparams.dynatemp_range    = json_value(data, "dynatemp_range",    default_sparams.dynatemp_range);
+  slot.sparams.dynatemp_exponent = json_value(data, "dynatemp_exponent", default_sparams.dynatemp_exponent);
+  slot.sparams.penalty_last_n    = json_value(data, "repeat_last_n",     default_sparams.penalty_last_n);
+  slot.sparams.penalty_repeat    = json_value(data, "repeat_penalty",    default_sparams.penalty_repeat);
+  slot.sparams.penalty_freq      = json_value(data, "frequency_penalty", default_sparams.penalty_freq);
+  slot.sparams.penalty_present   = json_value(data, "presence_penalty",  default_sparams.penalty_present);
+  slot.sparams.mirostat          = json_value(data, "mirostat",          default_sparams.mirostat);
+  slot.sparams.mirostat_tau      = json_value(data, "mirostat_tau",      default_sparams.mirostat_tau);
+  slot.sparams.mirostat_eta      = json_value(data, "mirostat_eta",      default_sparams.mirostat_eta);
+  slot.sparams.penalize_nl       = json_value(data, "penalize_nl",       default_sparams.penalize_nl);
+  slot.params.n_keep             = json_value(data, "n_keep",            slot.params.n_keep);
+  slot.params.n_discard          = json_value(data, "n_discard",         default_params.n_discard);
+  slot.sparams.seed              = json_value(data, "seed",              default_sparams.seed);
+  slot.sparams.n_probs           = json_value(data, "n_probs",           default_sparams.n_probs);
+  slot.sparams.min_keep          = json_value(data, "min_keep",          default_sparams.min_keep);
+
+  // process "json_schema" and "grammar"
+  if (data.contains("json_schema") && !data.at("json_schema").is_null() && data.contains("grammar") && !data.at("grammar").is_null()) {
+    sendError(task.id, "Either \"json_schema\" or \"grammar\" can be specified, but not both", ERROR_TYPE_INVALID_REQUEST);
+    return false;
+  } else if (data.contains("json_schema") && !data.contains("grammar")) {
+    try {
+      auto schema                = json_value(data, "json_schema", json::object());
+      slot.sparams.grammar       = json_schema_to_grammar(schema);
+    } catch (const std::exception & e) {
+      sendError(task.id, std::string("\"json_schema\": ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+      return false;
+    }
+  } else {
+    slot.sparams.grammar       = json_value(data, "grammar",           default_sparams.grammar);
+  }
+
+  if (slot.params.cache_prompt && slot.ga_n != 1) {
+    slot.params.cache_prompt = false;
+  }
+
+  if (slot.n_predict > 0 && slot.params.n_predict > slot.n_predict) {
+    slot.params.n_predict = slot.n_predict;
+  }
+  
+  // infill
+  slot.params.input_prefix = json_value(data, "input_prefix", default_params.input_prefix);
+  slot.params.input_suffix = json_value(data, "input_suffix", default_params.input_suffix);
+
+  // get prompt
+  {
+    const auto & prompt = data.find("prompt");
+    if (prompt == data.end()) {
+      sendError(task.id, "Either \"prompt\" or \"messages\" must be provided", ERROR_TYPE_INVALID_REQUEST);
+      return false;
+    } else {
+      slot.prompt = *prompt;
+    }
+    if (slot.prompt.is_array() && slot.prompt.empty()) {
+      sendError(task.id, "\"prompt\" cannot be an empty array", ERROR_TYPE_INVALID_REQUEST);
+      return false;
+    }
+  }
+
+  // penalize user-provided tokens
+  {
+    slot.sparams.penalty_prompt_tokens.clear();
+    slot.sparams.use_penalty_prompt_tokens = false;
+
+    const auto & penalty_prompt = data.find("penalty_prompt");
+
+    if (penalty_prompt != data.end()) {
+      if (penalty_prompt->is_string()) {
+        const auto penalty_prompt_string = penalty_prompt->get<std::string>();
+        slot.sparams.penalty_prompt_tokens = llama_tokenize(model, penalty_prompt_string, false);
+
+        if (slot.params.n_predict > 0) {
+          slot.sparams.penalty_prompt_tokens.reserve(slot.sparams.penalty_prompt_tokens.size() + slot.params.n_predict);
+        }
+        slot.sparams.use_penalty_prompt_tokens = true;
+      }
+      else if (penalty_prompt->is_array()) {
+        const auto n_tokens = penalty_prompt->size();
+        slot.sparams.penalty_prompt_tokens.reserve(n_tokens + std::max(0, slot.params.n_predict));
+
+        const int n_vocab = llama_n_vocab(model);
+        for (const auto & penalty_token : *penalty_prompt) {
+          if (penalty_token.is_number_integer()) {
+            const auto tok = penalty_token.get<llama_token>();
+            if (tok >= 0 && tok < n_vocab) {
+              slot.sparams.penalty_prompt_tokens.push_back(tok);
+            }
+          }
+        }
+        slot.sparams.use_penalty_prompt_tokens = true;
+      }
+    }
+  }
+
+  {
+    slot.sparams.logit_bias.clear();
+
+    if (json_value(data, "ignore_eos", false)) {
+      slot.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
+    }
+
+    const auto & logit_bias = data.find("logit_bias");
+    if (logit_bias != data.end() && logit_bias->is_array()) {
+      const int n_vocab = llama_n_vocab(model);
+      for (const auto & el : *logit_bias) {
+        // TODO: we may want to throw errors here, in case "el" is incorrect
+        if (el.is_array() && el.size() == 2) {
+          float bias;
+          if (el[1].is_number()) {
+            bias = el[1].get<float>();
+          } else if (el[1].is_boolean() && !el[1].get<bool>()) {
+            bias = -INFINITY;
+          } else {
+            continue;
+          }
+
+          if (el[0].is_number_integer()) {
+            llama_token tok = el[0].get<llama_token>();
+            if (tok >= 0 && tok < n_vocab) {
+              slot.sparams.logit_bias[tok] = bias;
+            }
+          } else if (el[0].is_string()) {
+            auto toks = llama_tokenize(model, el[0].get<std::string>(), false);
+            for (auto tok : toks) {
+              slot.sparams.logit_bias[tok] = bias;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  {
+    slot.params.antiprompt.clear();
+
+    const auto & stop = data.find("stop");
+    if (stop != data.end() && stop->is_array()) {
+      for (const auto & word : *stop) {
+        if (!word.empty()) {
+          slot.params.antiprompt.push_back(word);
+        }
+      }
+    }
+  }
+
+  {
+    const auto & samplers_sequence = data.find("samplers");
+    if (samplers_sequence != data.end() && samplers_sequence->is_array()) {
+      std::vector<std::string> sampler_names;
+      for (const auto & sampler_name : *samplers_sequence) {
+        if (sampler_name.is_string()) {
+          sampler_names.emplace_back(sampler_name);
+        }
+      }
+      slot.sparams.samplers_sequence = llama_sampling_types_from_names(sampler_names, false);
+    } else {
+      slot.sparams.samplers_sequence = default_sparams.samplers_sequence;
+    }
+  }
+
+  {
+    if (slot.ctx_sampling != nullptr) {
+      llama_sampling_free(slot.ctx_sampling);
+    }
+    slot.ctx_sampling = llama_sampling_init(slot.sparams);
+    if (slot.ctx_sampling == nullptr) {
+      // for now, the only error that may happen here is invalid grammar
+      sendError(task.id, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
+      return false;
+    }
+  }
+
+  slot.command = SLOT_COMMAND_LOAD_PROMPT;
+  slot.prompt_tokens.clear();
+
+  return true;
+}
+
+/* ================================================================= */
+/* do the hard job, use llama.cpp api to inference */
 /* ================================================================= */
 
 std::vector<llama_token> tokenize(llama_context *ctx, const json & json_prompt, bool add_special) {
@@ -448,8 +810,6 @@ bool InferenceContext::processToken(completion_token_output & result, server_slo
 
   // search stop word and delete it
   slot.generated_text += token_str;
-  std::cout << token_str << std::endl;
-
   slot.has_next_token = true;
 
   if (slot.ctx_sampling->params.use_penalty_prompt_tokens && result.tok != -1) {
@@ -521,6 +881,11 @@ bool InferenceContext::processToken(completion_token_output & result, server_slo
     slot.has_next_token = false;
   }
 
+  if (ggml_time_us() - slot.t_start_generation > inference_timeout_) {
+    slot.stopped_limit  = true;
+    slot.has_next_token = false;
+  }
+
   if (llama_token_is_eog(model, result.tok)) {
     slot.stopped_eos    = true;
     slot.has_next_token = false;
@@ -585,7 +950,6 @@ void InferenceContext::updateSlots() {
     if (slot.state == SLOT_STATE_IDLE) {
       continue;
     }
-    // std::cout << "fuck" <<  slot.id << std::endl;
     slot.i_batch = batch.n_tokens;
 
     const int32_t slot_npast = slot.n_past_se > 0 ? slot.n_past_se : slot.n_past;
@@ -906,7 +1270,6 @@ void InferenceContext::updateSlots() {
       if (slot.n_decoded == 1) {
           slot.t_start_generation = ggml_time_us();
           slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-          metrics.on_prompt_eval(slot);
       }
 
       llama_token_data_array cur_p = { slot.ctx_sampling->cur.data(), slot.ctx_sampling->cur.size(), false };
@@ -943,7 +1306,6 @@ void InferenceContext::updateSlots() {
         slot.release();
         slot.print_timings();
         sendFinalResponse(slot);
-        metrics.on_prediction(slot);
       }
 
       slot.i_batch = -1;
@@ -952,319 +1314,10 @@ void InferenceContext::updateSlots() {
 
 }
 
-bool InferenceContext::launchSlotWithTask(server_slot & slot, const server_task & task) {
-  slot_params default_params;
-  llama_sampling_params default_sparams;
-  auto & data = task.data;
-
-  if (data.count("__oaicompat") != 0) {
-    slot.oaicompat = true;
-    slot.oaicompat_model = json_value(data, "model", std::string(DEFAULT_OAICOMPAT_MODEL));
-  } else {
-    slot.oaicompat = false;
-    slot.oaicompat_model = "";
-  }
-  slot.params.stream             = json_value(data, "stream",            false);
-  slot.params.cache_prompt       = json_value(data, "cache_prompt",      false);
-  slot.params.n_predict          = json_value(data, "n_predict",         default_params.n_predict);
-  slot.sparams.top_k             = json_value(data, "top_k",             default_sparams.top_k);
-  slot.sparams.top_p             = json_value(data, "top_p",             default_sparams.top_p);
-  slot.sparams.min_p             = json_value(data, "min_p",             default_sparams.min_p);
-  slot.sparams.tfs_z             = json_value(data, "tfs_z",             default_sparams.tfs_z);
-  slot.sparams.typical_p         = json_value(data, "typical_p",         default_sparams.typical_p);
-  slot.sparams.temp              = json_value(data, "temperature",       default_sparams.temp);
-  slot.sparams.dynatemp_range    = json_value(data, "dynatemp_range",    default_sparams.dynatemp_range);
-  slot.sparams.dynatemp_exponent = json_value(data, "dynatemp_exponent", default_sparams.dynatemp_exponent);
-  slot.sparams.penalty_last_n    = json_value(data, "repeat_last_n",     default_sparams.penalty_last_n);
-  slot.sparams.penalty_repeat    = json_value(data, "repeat_penalty",    default_sparams.penalty_repeat);
-  slot.sparams.penalty_freq      = json_value(data, "frequency_penalty", default_sparams.penalty_freq);
-  slot.sparams.penalty_present   = json_value(data, "presence_penalty",  default_sparams.penalty_present);
-  slot.sparams.mirostat          = json_value(data, "mirostat",          default_sparams.mirostat);
-  slot.sparams.mirostat_tau      = json_value(data, "mirostat_tau",      default_sparams.mirostat_tau);
-  slot.sparams.mirostat_eta      = json_value(data, "mirostat_eta",      default_sparams.mirostat_eta);
-  slot.sparams.penalize_nl       = json_value(data, "penalize_nl",       default_sparams.penalize_nl);
-  slot.params.n_keep             = json_value(data, "n_keep",            slot.params.n_keep);
-  slot.params.n_discard          = json_value(data, "n_discard",         default_params.n_discard);
-  slot.sparams.seed              = json_value(data, "seed",              default_sparams.seed);
-  slot.sparams.n_probs           = json_value(data, "n_probs",           default_sparams.n_probs);
-  slot.sparams.min_keep          = json_value(data, "min_keep",          default_sparams.min_keep);
-
-  // process "json_schema" and "grammar"
-  if (data.contains("json_schema") && !data.at("json_schema").is_null() && data.contains("grammar") && !data.at("grammar").is_null()) {
-    sendError(task.id, "Either \"json_schema\" or \"grammar\" can be specified, but not both", ERROR_TYPE_INVALID_REQUEST);
-    return false;
-  } else if (data.contains("json_schema") && !data.contains("grammar")) {
-    try {
-      auto schema                = json_value(data, "json_schema", json::object());
-      slot.sparams.grammar       = json_schema_to_grammar(schema);
-    } catch (const std::exception & e) {
-      sendError(task.id, std::string("\"json_schema\": ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
-      return false;
-    }
-  } else {
-    slot.sparams.grammar       = json_value(data, "grammar",           default_sparams.grammar);
-  }
-
-  if (slot.params.cache_prompt && slot.ga_n != 1) {
-    slot.params.cache_prompt = false;
-  }
-
-  if (slot.n_predict > 0 && slot.params.n_predict > slot.n_predict) {
-    slot.params.n_predict = slot.n_predict;
-  }
-  
-  // infill
-  slot.params.input_prefix = json_value(data, "input_prefix", default_params.input_prefix);
-  slot.params.input_suffix = json_value(data, "input_suffix", default_params.input_suffix);
-
-  // get prompt
-  {
-    const auto & prompt = data.find("prompt");
-    if (prompt == data.end()) {
-      sendError(task.id, "Either \"prompt\" or \"messages\" must be provided", ERROR_TYPE_INVALID_REQUEST);
-      return false;
-    } else {
-      slot.prompt = *prompt;
-    }
-    if (slot.prompt.is_array() && slot.prompt.empty()) {
-      sendError(task.id, "\"prompt\" cannot be an empty array", ERROR_TYPE_INVALID_REQUEST);
-      return false;
-    }
-  }
-
-  // penalize user-provided tokens
-  {
-    slot.sparams.penalty_prompt_tokens.clear();
-    slot.sparams.use_penalty_prompt_tokens = false;
-
-    const auto & penalty_prompt = data.find("penalty_prompt");
-
-    if (penalty_prompt != data.end()) {
-      if (penalty_prompt->is_string()) {
-        const auto penalty_prompt_string = penalty_prompt->get<std::string>();
-        slot.sparams.penalty_prompt_tokens = llama_tokenize(model, penalty_prompt_string, false);
-
-        if (slot.params.n_predict > 0) {
-          slot.sparams.penalty_prompt_tokens.reserve(slot.sparams.penalty_prompt_tokens.size() + slot.params.n_predict);
-        }
-        slot.sparams.use_penalty_prompt_tokens = true;
-      }
-      else if (penalty_prompt->is_array()) {
-        const auto n_tokens = penalty_prompt->size();
-        slot.sparams.penalty_prompt_tokens.reserve(n_tokens + std::max(0, slot.params.n_predict));
-
-        const int n_vocab = llama_n_vocab(model);
-        for (const auto & penalty_token : *penalty_prompt) {
-          if (penalty_token.is_number_integer()) {
-            const auto tok = penalty_token.get<llama_token>();
-            if (tok >= 0 && tok < n_vocab) {
-              slot.sparams.penalty_prompt_tokens.push_back(tok);
-            }
-          }
-        }
-        slot.sparams.use_penalty_prompt_tokens = true;
-      }
-    }
-  }
-
-  {
-    slot.sparams.logit_bias.clear();
-
-    if (json_value(data, "ignore_eos", false)) {
-      slot.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
-    }
-
-    const auto & logit_bias = data.find("logit_bias");
-    if (logit_bias != data.end() && logit_bias->is_array()) {
-      const int n_vocab = llama_n_vocab(model);
-      for (const auto & el : *logit_bias) {
-        // TODO: we may want to throw errors here, in case "el" is incorrect
-        if (el.is_array() && el.size() == 2) {
-          float bias;
-          if (el[1].is_number()) {
-            bias = el[1].get<float>();
-          } else if (el[1].is_boolean() && !el[1].get<bool>()) {
-            bias = -INFINITY;
-          } else {
-            continue;
-          }
-
-          if (el[0].is_number_integer()) {
-            llama_token tok = el[0].get<llama_token>();
-            if (tok >= 0 && tok < n_vocab) {
-              slot.sparams.logit_bias[tok] = bias;
-            }
-          } else if (el[0].is_string()) {
-            auto toks = llama_tokenize(model, el[0].get<std::string>(), false);
-            for (auto tok : toks) {
-              slot.sparams.logit_bias[tok] = bias;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  {
-    slot.params.antiprompt.clear();
-
-    const auto & stop = data.find("stop");
-    if (stop != data.end() && stop->is_array()) {
-      for (const auto & word : *stop) {
-        if (!word.empty()) {
-          slot.params.antiprompt.push_back(word);
-        }
-      }
-    }
-  }
-
-  {
-    const auto & samplers_sequence = data.find("samplers");
-    if (samplers_sequence != data.end() && samplers_sequence->is_array()) {
-      std::vector<std::string> sampler_names;
-      for (const auto & sampler_name : *samplers_sequence) {
-        if (sampler_name.is_string()) {
-          sampler_names.emplace_back(sampler_name);
-        }
-      }
-      slot.sparams.samplers_sequence = sampler_types_from_names(sampler_names, false);
-    } else {
-      slot.sparams.samplers_sequence = default_sparams.samplers_sequence;
-    }
-  }
-
-  {
-    if (slot.ctx_sampling != nullptr) {
-      llama_sampling_free(slot.ctx_sampling);
-    }
-    slot.ctx_sampling = llama_sampling_init(slot.sparams);
-    if (slot.ctx_sampling == nullptr) {
-      // for now, the only error that may happen here is invalid grammar
-      sendError(task.id, "Failed to parse grammar", ERROR_TYPE_INVALID_REQUEST);
-      return false;
-    }
-  }
-
-  slot.command = SLOT_COMMAND_LOAD_PROMPT;
-  slot.prompt_tokens.clear();
-
-  return true;
-}
-
-void InferenceContext::processSingleTask(const server_task & task) {
-  switch (task.type) {
-    case SERVER_TASK_TYPE_COMPLETION:
-    {
-      server_slot * slot = nullptr;
-      int id_slot = json_value(task.data, "id_slot", -1);
-
-      int64_t t_last = ggml_time_us();
-      for (server_slot & use_slot : slots) {
-        // among all available slots, find the one that has been least recently used
-        if (use_slot.id == id_slot && use_slot.available()) {
-          slot = &use_slot;
-          break;
-        }
-        if (use_slot.available() && use_slot.t_last_used < t_last) {
-          slot = &use_slot;
-          t_last = use_slot.t_last_used;
-        }
-      }
-
-      if (slot == nullptr) {
-          // if no slot is available, we defer this task for processing later
-        inference_thread_.addTask([this, task](){
-          this->processSingleTask(task);
-        });
-        return;
-      }
-
-      slot->reset();
-
-      slot->id_task   = task.id;
-      slot->infill    = task.infill;
-      slot->embedding = task.embedding;
-
-      if (!launchSlotWithTask(*slot, task)) {
-        return;
-      }
-    } break;
-    case SERVER_TASK_TYPE_CANCEL:
-    {
-      // release slot linked with the task id
-      for (auto & use_slot : slots) {
-        if (use_slot.id_task == task.id_target) {
-          use_slot.release();
-          break;
-        }
-      }
-    } break;
-    case SERVER_TASK_TYPE_NEXT_RESPONSE:
-    {
-      // do nothing
-    } break;
-  }
-  updateSlots();
-}
-
-void InferenceContext::modelInference(LookupBodyCallback&& cb, std::shared_ptr<InferenceTaskMetaData>&& task_meta_data) {
-  callback_body_[task_meta_data->id] = std::move(cb);
-  completion_id_ = gen_chatcmplid();
-
-  server_task task;
-  task.id = task_meta_data->id;
-  task.id_target = task_meta_data->id_target;
-  task.infill = task_meta_data->infill;
-  try {
-    task.data = json::parse(task_meta_data->data);
-  } catch (const std::exception &) {
-    sendError(task.id, "request data is wrong", ERROR_TYPE_INVALID_REQUEST);
-    return;
-  }
-
-  switch (task_meta_data->type) {
-    case InferencetasktypeTypeCompletion:
-    {
-      is_openai_ = true;
-      task.data = oaicompat_completion_params_parse(model, task.data, chat_template_);
-      task.type = SERVER_TASK_TYPE_COMPLETION;
-      task.embedding = false;
-    } break;
-    case InferencetasktypeTypeEmbeedings:
-    {
-      task.embedding = true;
-      is_openai_ = false;
-      // an input prompt can be a string or a list of tokens (integer)
-      json prompt;
-      if (task.data.count("input") != 0) {
-          is_openai_ = true;
-          prompt = task.data.at("input");
-      } else if (task.data.count("content") != 0) {
-          // with "content", we only support single prompt
-          prompt = std::vector<std::string>{task.data.at("content")};
-      } else {
-          sendError(task.id, "input or content must be provided", ERROR_TYPE_INVALID_REQUEST);
-          return;
-      }
-      task.data = json{{"prompt", prompt}};
-      task.type = SERVER_TASK_TYPE_COMPLETION;
-    } break;
-    case InferencetasktypeTypeCancel:
-    {
-      task.type = SERVER_TASK_TYPE_CANCEL;
-      break;
-    }
-  }
-  std::cout << task.data.dump(-1, ' ', false, json::error_handler_t::replace) << std::endl;
-  inference_thread_.addTask([this, task](){
-    this->processSingleTask(task);
-  });
-}
-
 /* ================================================================= */
 /*
-The top part mainly does the work of loading models and loading inference tasks, 
-and the bottom part mainly does the work of model inference
+The top part mainly does the work of loading models and doing model inference, 
+and the bottom part mainly does the work of sending generated tokens.
 */
 /* ================================================================= */
 

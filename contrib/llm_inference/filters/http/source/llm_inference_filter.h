@@ -28,8 +28,6 @@ private:
 
 using LLMInferenceFilterConfigSharedPtr = std::shared_ptr<LLMInferenceFilterConfig>;
 
-using ModelChosen = std::string;
-
 class LLMInferenceFilterConfigPerRoute : public Router::RouteSpecificFilterConfig  {
 public:
   LLMInferenceFilterConfigPerRoute(const envoy::extensions::filters::http::llm_inference::v3::modelChosen& proto_config);
@@ -68,7 +66,11 @@ private:
   const InferenceContextSharedPtr ctx_;
 
   Http::StreamDecoderFilterCallbacks* decoder_callbacks_;
+  Event::TimerPtr timer_;
   InferenceTaskType task_type_;
+  Buffer::InstancePtr request_data_;
+  int first_byte_timeout_ = 10;
+  int inference_timeout_ = 90;
   int id_task_ = -1;
   bool header_ = false;
   const ModelParameter modelParameter() const;

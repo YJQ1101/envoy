@@ -18,10 +18,9 @@ resources:
             "@type": type.googleapis.com/envoy.extensions.filters.http.llm_inference.v3.modelParameter
             n_threads : 64
             n_parallel : 2
-            embedding : false
             modelpath: {
               "qwen2": "/home/yuanjq/model/qwen2-7b-instruct-q5_k_m.gguf",
-              "llama3": "/home/yuanjq/model/Meta-Llama-3-8B-Instruct-fp16.gguf",
+              "llama3": "/home/yuanjq/model/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
               "bge": "/home/yuanjq/model/bge-small-zh-v1.5-f32.gguf"
             }
         - name: envoy.filters.http.router
@@ -36,18 +35,23 @@ resources:
               # typed_per_filter_config:
               #   envoy.filters.http.llm_inference:
               #     "@type": type.googleapis.com/envoy.extensions.filters.http.llm_inference.v3.modelChosen
-              #     usemodel: "bge"
+                  # usemodel: "qwen2"
+                  # first_byte_timeout : 2
+                  # inference_timeout : 90
+                  # embedding : true
               # direct_response:
-              #   status: 200
+              #   status: 504
               #   body:
-              #     inline_string: "hello - prefix"
+              #     inline_string: "inference timeout"
                 prefix: "/v1/chat/completions"
               typed_per_filter_config:
                 envoy.filters.http.llm_inference:
                   "@type": type.googleapis.com/envoy.extensions.filters.http.llm_inference.v3.modelChosen
                   usemodel: "qwen2"
+                  first_byte_timeout : 4
+                  inference_timeout : 90
+                  embedding : false
               direct_response:
-                status: 200
+                status: 504
                 body:
-                  inline_string: "hello - prefix"
-
+                  inline_string: "inference timeout"
